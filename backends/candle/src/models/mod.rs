@@ -5,6 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 mod bert;
+mod deberta;
 mod dense;
 mod distilbert;
 mod jina;
@@ -50,6 +51,7 @@ mod qwen3;
 
 pub use bert::{BertConfig, BertModel, PositionEmbeddingType};
 use candle::{Result, Tensor};
+pub use deberta::{DeBertaConfig, DeBertaModel};
 pub use dense::{Dense, DenseConfig, DenseLayer};
 pub use distilbert::{DistilBertConfig, DistilBertModel};
 #[allow(unused_imports)]
