@@ -38,7 +38,6 @@ pub struct DeBertaConfig {
 #[derive(Debug)]
 pub struct DeBertaEmbeddings {
     word_embeddings: Embedding,
-    position_embeddings: Option<Embedding>,
     token_type_embeddings: Option<Embedding>,
     layer_norm: LayerNorm,
     span: tracing::Span,
@@ -51,19 +50,6 @@ impl DeBertaEmbeddings {
                 .get((config.vocab_size, config.hidden_size), "weight")?,
             config.hidden_size,
         );
-
-        // DeBERTa v2 with relative attention typically doesn't use position embeddings
-        let position_embeddings = if !config.relative_attention {
-            match vb.pp("position_embeddings").get(
-                (config.max_position_embeddings, config.hidden_size),
-                "weight",
-            ) {
-                Ok(w) => Some(Embedding::new(w, config.hidden_size)),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
 
         // Only create token_type_embeddings if type_vocab_size > 0
         let token_type_embeddings = if config.type_vocab_size > 0 {
@@ -86,7 +72,6 @@ impl DeBertaEmbeddings {
 
         Ok(Self {
             word_embeddings,
-            position_embeddings,
             token_type_embeddings,
             layer_norm,
             span: tracing::span!(tracing::Level::TRACE, "embeddings"),
@@ -105,10 +90,6 @@ impl DeBertaEmbeddings {
 
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
-        }
-
-        if let Some(ref position_embeddings) = self.position_embeddings {
-            embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
         }
 
         let embeddings = self.layer_norm.forward(&embeddings, None)?;
@@ -385,7 +366,7 @@ impl DeBertaLayer {
 struct DeBertaEncoder {
     layers: Vec<DeBertaLayer>,
     relative_attention: Option<DeBertaRelativeEmbeddings>,
-    layer_norm: Option<LayerNorm>, // Add this field
+    layer_norm: Option<LayerNorm>,
     span: tracing::Span,
 }
 
@@ -396,7 +377,6 @@ impl DeBertaEncoder {
             layers.push(DeBertaLayer::load(vb.pp(&format!("layer.{}", i)), config)?);
         }
 
-        // rel_embeddings is directly under encoder, not nested deeper
         let relative_attention = if config.relative_attention {
             Some(DeBertaRelativeEmbeddings::load(
                 vb.pp("rel_embeddings"),
