@@ -132,6 +132,7 @@ struct DeBertaDisentangledSelfAttention {
     all_head_size: usize,
 
     pos_dropout: f64,
+    softmax_scale: f64,
 
     span: tracing::Span,
 }
@@ -162,6 +163,9 @@ impl DeBertaDisentangledSelfAttention {
             None,
         );
 
+        // TODO: It's 3 times this, once we positional embedding computations.
+        let softmax_scale = 1. / (attention_head_size as f64).sqrt();
+
         Ok(Self {
             query_proj,
             key_proj,
@@ -174,6 +178,7 @@ impl DeBertaDisentangledSelfAttention {
             attention_head_size,
             all_head_size,
             pos_dropout: config.hidden_dropout_prob,
+            softmax_scale,
             span: tracing::span!(tracing::Level::TRACE, "disentangled_self_attention"),
         })
     }
@@ -198,16 +203,17 @@ impl DeBertaDisentangledSelfAttention {
         let key_layer = self.transpose_for_scores(&key_layer, batch_size, seq_len)?;
         let value_layer = self.transpose_for_scores(&value_layer, batch_size, seq_len)?;
 
-        // TODO: Implement disentangled attention mechanism
-        // This is a simplified version - actual implementation would compute:
-        // 1. Content-to-content attention
-        // 2. Content-to-position attention
-        // 3. Position-to-content attention
+        // For standard attention (not disentangled yet), we need shapes:
+        // query: [batch_size, num_heads, seq_len, head_size]
+        // key: [batch_size, num_heads, seq_len, head_size]
+        // value: [batch_size, num_heads, seq_len, head_size]
 
-        // For now, just do standard attention as placeholder
-        let attention_scores = query_layer.matmul(&key_layer.transpose(D::Minus2, D::Minus1)?)?;
-        let attention_scores =
-            (attention_scores * (1.0 / (self.attention_head_size as f64).sqrt()))?;
+        // Compute attention scores
+        // Instead of transpose(D::Minus2, D::Minus1), use explicit dimensions
+        let key_layer_t = key_layer.transpose(2, 3)?; // [batch_size, num_heads, head_size, seq_len]
+
+        let attention_scores = query_layer.matmul(&key_layer_t)?; // [batch_size, num_heads, seq_len, seq_len]
+        let attention_scores = (attention_scores * self.softmax_scale)?;
 
         let attention_scores = if let Some(attention_mask) = attention_mask {
             attention_scores.broadcast_add(attention_mask)?
@@ -216,10 +222,13 @@ impl DeBertaDisentangledSelfAttention {
         };
 
         let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
-        let context_layer = attention_probs.matmul(&value_layer)?;
+
+        // Apply attention to values
+        let context_layer = attention_probs.matmul(&value_layer)?; // [batch_size, num_heads, seq_len, head_size]
 
         // Transpose back and reshape
-        let context_layer = context_layer.transpose(1, 2)?.contiguous()?;
+        let context_layer = context_layer.transpose(1, 2)?; // [batch_size, seq_len, num_heads, head_size]
+        let context_layer = context_layer.contiguous()?;
         let context_layer = context_layer.reshape((batch_size, seq_len, self.all_head_size))?;
 
         Ok(context_layer)
@@ -231,13 +240,16 @@ impl DeBertaDisentangledSelfAttention {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
+        // Reshape from [batch_size, seq_len, hidden_size]
+        // to [batch_size, seq_len, num_heads, head_size]
         let x = x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
         ))?;
-        x.transpose(1, 2)
+        // Transpose to [batch_size, num_heads, seq_len, head_size]
+        x.transpose(1, 2)?.contiguous()
     }
 }
 
