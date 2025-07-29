@@ -35,38 +35,6 @@ pub struct DeBertaConfig {
     pub norm_rel_ebd: Option<String>,
 }
 
-impl Default for DeBertaConfig {
-    fn default() -> Self {
-        Self {
-            vocab_size: 50265,
-            hidden_size: 768,
-            num_hidden_layers: 12,
-            num_attention_heads: 12,
-            intermediate_size: 3072,
-            hidden_act: HiddenAct::Gelu,
-            hidden_dropout_prob: 0.1,
-            attention_probs_dropout_prob: 0.1,
-            max_position_embeddings: 512,
-            type_vocab_size: 0,
-            initializer_range: 0.02,
-            layer_norm_eps: 1e-7,
-            pad_token_id: 0,
-            position_embedding_type: Some("relative".to_string()),
-            use_cache: Some(true),
-            classifier_dropout: None,
-            id2label: None,
-
-            // DeBERTa specific defaults
-            relative_attention: true,
-            pos_att_type: Some(vec!["p2c".to_string(), "c2p".to_string()]),
-            max_relative_positions: Some(256),
-            position_buckets: Some(256),
-            share_att_key: Some(true),
-            norm_rel_ebd: Some("layer_norm".to_string()),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct DeBertaEmbeddings {
     word_embeddings: Embedding,
@@ -414,11 +382,7 @@ impl DeBertaEncoder {
 
         let relative_attention = if config.relative_attention {
             Some(DeBertaRelativeEmbeddings::load(
-                // FIXME: Signature is different!
-                vb.pp("rel_embeddings").get(
-                    (config.max_position_embeddings, config.hidden_size),
-                    "weight",
-                )?,
+                vb.pp("rel_embeddings"),
                 config,
             )?)
         } else {
@@ -498,6 +462,10 @@ impl DeBertaRelativeEmbeddings {
         let max_relative_positions = config.max_relative_positions.unwrap_or(256);
         let hidden_size = config.hidden_size;
 
+        //.pp("rel_embeddings").get(
+        //            (config.max_position_embeddings, config.hidden_size),
+        //            "weight",
+        //        )?,
         let embeddings = Embedding::new(
             vb.get((max_relative_positions as usize * 2, hidden_size), "weight")?,
             hidden_size,
