@@ -144,7 +144,10 @@ impl DeBertaDisentangledSelfAttention {
             None,
         );
 
-        // TODO: It's 3 times this, once we positional embedding computations.
+        // FIXME: pos_key_proj
+        // FIXME: pos_value_proj
+
+        // TODO: It's up to 3 times this, once we positional embedding computations.
         let softmax_scale = 1. / (attention_head_size as f64).sqrt();
 
         Ok(Self {
@@ -858,11 +861,9 @@ impl Model for DeBertaModel {
         match &self.classifier {
             None => candle::bail!("`predict` is not implemented for embedding models"),
             Some(classifier) => {
-                // Use the forward method which handles pooling
                 let (pooled_embeddings, _raw_embeddings) = self.forward(batch)?;
                 let pooled_embeddings =
                     pooled_embeddings.expect("pooled_embeddings is empty. This is a bug.");
-                // pooled_embeddings shape: [batch_size, hidden_size]
                 classifier.forward(&pooled_embeddings)
             }
         }
