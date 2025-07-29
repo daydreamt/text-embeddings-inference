@@ -538,9 +538,15 @@ impl DeBertaClassificationHead {
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
 
-        // Use CLS token (first token) directly
-        let pooled = hidden_states.i((.., 0))?;
-        let logits = self.classifier.forward(&pooled)?;
+        // The input here should already be pooled embeddings of shape [batch_size, hidden_size]
+        // Following BERT's pattern, we need to add and remove a dimension for the linear layer
+        let mut hidden_states = hidden_states.unsqueeze(1)?; // [batch_size, 1, hidden_size]
+
+        // Note: DeBERTa v2 typically doesn't have a separate pooler layer in the classifier
+        // The pooling happens in the main model's forward method
+        let logits = self.classifier.forward(&hidden_states)?; // [batch_size, 1, n_classes]
+        let logits = logits.squeeze(1)?; // [batch_size, n_classes]
+
         Ok(logits)
     }
 }
@@ -860,9 +866,11 @@ impl Model for DeBertaModel {
         match &self.classifier {
             None => candle::bail!("`predict` is not implemented for embedding models"),
             Some(classifier) => {
+                // Use the forward method which handles pooling
                 let (pooled_embeddings, _raw_embeddings) = self.forward(batch)?;
                 let pooled_embeddings =
                     pooled_embeddings.expect("pooled_embeddings is empty. This is a bug.");
+                // pooled_embeddings shape: [batch_size, hidden_size]
                 classifier.forward(&pooled_embeddings)
             }
         }
