@@ -322,7 +322,7 @@ impl DeBertaDisentangledSelfAttention {
         relative_pos: &Tensor,
         rel_embeddings: &Tensor,
     ) -> Result<Tensor> {
-        let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
+        let (total_bs_heads, q_len, _d_head) = query_layer.dims3()?;
         let k_len = key_layer.dim(1)?;
         let n_head = self.num_attention_heads;
         let bs = total_bs_heads / n_head;
@@ -348,22 +348,34 @@ impl DeBertaDisentangledSelfAttention {
 
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        let (pos_query_layer_proj, pos_key_layer_proj) = if self.share_att_key {
-            (
-                Some(self.query_proj.forward(&rel_embeddings)?),
-                Some(self.key_proj.forward(&rel_embeddings)?),
-            )
-        } else {
-            (
-                self.pos_query_proj
-                    .as_ref()
-                    .map(|l| l.forward(&rel_embeddings))
-                    .transpose()?,
-                self.pos_key_proj
-                    .as_ref()
-                    .map(|l| l.forward(&rel_embeddings))
-                    .transpose()?,
-            )
+        // THE FIX: Unify the logic for creating positional query/key layers.
+        // This ensures they are always projected, transposed, made contiguous, and repeated for the batch.
+        let (pos_query_layer, pos_key_layer) = {
+            let (q_proj, k_proj) = if self.share_att_key {
+                (Some(&self.query_proj), Some(&self.key_proj))
+            } else {
+                (self.pos_query_proj.as_ref(), self.pos_key_proj.as_ref())
+            };
+
+            let pos_key = if let Some(k_proj) = k_proj {
+                let p_key = k_proj.forward(&rel_embeddings)?;
+                let p_key = p_key.unsqueeze(0)?;
+                let transposed = self.transpose_for_scores(&p_key, 1, 2 * att_span as usize)?;
+                Some(transposed.repeat((bs, 1, 1))?)
+            } else {
+                None
+            };
+
+            let pos_query = if let Some(q_proj) = q_proj {
+                let p_query = q_proj.forward(&rel_embeddings)?;
+                let p_query = p_query.unsqueeze(0)?;
+                let transposed = self.transpose_for_scores(&p_query, 1, 2 * att_span as usize)?;
+                Some(transposed.repeat((bs, 1, 1))?)
+            } else {
+                None
+            };
+
+            (pos_query, pos_key)
         };
 
         let mut score = Tensor::zeros(
@@ -373,17 +385,9 @@ impl DeBertaDisentangledSelfAttention {
         )?;
 
         if self.pos_att_type.contains(&"c2p".to_string()) {
-            let p_key = pos_key_layer_proj
+            let pos_key_layer = pos_key_layer
                 .as_ref()
                 .ok_or_else(|| candle::Error::Msg("pos_key_proj not found for c2p".to_string()))?;
-
-            let pos_key_layer = p_key
-                .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)?
-                .contiguous()?
-                .unsqueeze(0)?
-                .repeat((bs, 1, 1, 1))?
-                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
 
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
             let c2p_att = c2p_att.gather(&pos_idx, 2)?;
@@ -391,20 +395,11 @@ impl DeBertaDisentangledSelfAttention {
         }
 
         if self.pos_att_type.contains(&"p2c".to_string()) {
-            let p_query = pos_query_layer_proj.as_ref().ok_or_else(|| {
+            let pos_query_layer = pos_query_layer.as_ref().ok_or_else(|| {
                 candle::Error::Msg("pos_query_proj not found for p2c".to_string())
             })?;
 
-            let pos_query_layer = p_query
-                .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)?
-                .contiguous()?
-                .unsqueeze(0)?
-                .repeat((bs, 1, 1, 1))?
-                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
-
             let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
-
             let p2c_att_transposed = p2c_att.transpose(1, 2)?;
             let pos_idx_transposed = pos_idx.transpose(1, 2)?;
             let gathered = p2c_att_transposed.gather(&pos_idx_transposed, 2)?;
