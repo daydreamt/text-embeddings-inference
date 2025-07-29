@@ -1,10 +1,18 @@
 use crate::layers::{HiddenAct, LayerNorm, Linear};
 use crate::models::Model;
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{bail, DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Embedding, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
 use text_embeddings_backend_core::{Batch, ModelType, Pool};
+
+// Helper function to build relative position ids, adapted from Hugging Face's candle implementation.
+fn build_relative_position(query_size: usize, key_size: usize, device: &Device) -> Result<Tensor> {
+    let q_ids = Tensor::arange(0, query_size as u32, device)?.to_dtype(DType::I64)?;
+    let k_ids = Tensor::arange(0, key_size as u32, device)?.to_dtype(DType::I64)?;
+    let rel_pos_ids = q_ids.unsqueeze(1)?.broadcast_sub(&k_ids.unsqueeze(0)?)?;
+    Ok(rel_pos_ids)
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DeBertaConfig {
@@ -41,7 +49,6 @@ pub struct DeBertaConfig {
     pub pooler_hidden_size: Option<usize>,
 }
 
-
 #[derive(Debug)]
 pub struct DeBertaEmbeddings {
     word_embeddings: Embedding,
@@ -74,7 +81,6 @@ impl DeBertaEmbeddings {
             None
         };
 
-        // Only create token_type_embeddings if type_vocab_size > 0
         let token_type_embeddings = if config.type_vocab_size > 0 {
             match vb
                 .pp("token_type_embeddings")
@@ -110,22 +116,16 @@ impl DeBertaEmbeddings {
         position_ids: &Tensor,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-
         let mut embeddings = self.word_embeddings.forward(input_ids)?;
-
         if self.position_biased_input {
             if let Some(ref position_embeddings) = self.position_embeddings {
                 embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
             }
         }
-
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
-
-        let embeddings = self.layer_norm.forward(&embeddings, None)?;
-
-        Ok(embeddings)
+        self.layer_norm.forward(&embeddings, None)
     }
 }
 
@@ -146,7 +146,6 @@ struct DeBertaDisentangledSelfAttention {
     all_head_size: usize,
 
     pos_dropout: f64,
-    softmax_scale: f64,
 
     span: tracing::Span,
 }
@@ -160,72 +159,64 @@ impl DeBertaDisentangledSelfAttention {
 
         let query_proj = Linear::new(
             vb.pp("query_proj")
-                .get((all_head_size, config.hidden_size), "weight")?
-                .transpose(0, 1)?,
+                .get((all_head_size, config.hidden_size), "weight")?,
             Some(vb.pp("query_proj").get(all_head_size, "bias")?),
             None,
         );
-
         let key_proj = Linear::new(
             vb.pp("key_proj")
-                .get((all_head_size, config.hidden_size), "weight")?
-                .transpose(0, 1)?,
+                .get((all_head_size, config.hidden_size), "weight")?,
             Some(vb.pp("key_proj").get(all_head_size, "bias")?),
             None,
         );
-
         let value_proj = Linear::new(
             vb.pp("value_proj")
-                .get((all_head_size, config.hidden_size), "weight")?
-                .transpose(0, 1)?,
+                .get((all_head_size, config.hidden_size), "weight")?,
             Some(vb.pp("value_proj").get(all_head_size, "bias")?),
             None,
         );
 
-        let share_att_key = config.share_att_key.unwrap_or(true);
+        let share_att_key = config.share_att_key.unwrap_or(false);
         let pos_att_type = config.pos_att_type.clone().unwrap_or_default();
+        let relative_attention = config.relative_attention;
+        let mut max_relative_positions = config.max_relative_positions.unwrap_or(-1);
+        if max_relative_positions < 1 {
+            max_relative_positions = config.max_position_embeddings as i64;
+        }
 
-        let (pos_key_proj, pos_query_proj) = if config.relative_attention && !share_att_key {
-            let pos_key_proj = if pos_att_type.iter().any(|s| s == "c2p") {
+        let (pos_key_proj, pos_query_proj) = if relative_attention && !share_att_key {
+            let pos_key_proj = if pos_att_type.iter().any(|t| t == "c2p" || t == "p2p") {
                 Some(Linear::new(
                     vb.pp("pos_key_proj")
-                        .get((all_head_size, config.hidden_size), "weight")?
-                        .transpose(0, 1)?,
+                        .get((all_head_size, config.hidden_size), "weight")?,
                     Some(vb.pp("pos_key_proj").get(all_head_size, "bias")?),
                     None,
                 ))
             } else {
                 None
             };
-
-            let pos_query_proj = if pos_att_type.iter().any(|s| s == "p2c") {
+            let pos_query_proj = if pos_att_type.iter().any(|t| t == "p2c" || t == "p2p") {
                 Some(Linear::new(
                     vb.pp("pos_query_proj")
-                        .get((all_head_size, config.hidden_size), "weight")?
-                        .transpose(0, 1)?,
-                    None, // No bias for pos_query_proj
+                        .get((all_head_size, config.hidden_size), "weight")?,
+                    Some(vb.pp("pos_query_proj").get(all_head_size, "bias")?),
                     None,
                 ))
             } else {
                 None
             };
-
             (pos_key_proj, pos_query_proj)
         } else {
-            // FIXME: Case where share_att_key
             (None, None)
         };
-
-        // FIXME: It's 3 in the paper if we have p2c and c2p
-        let softmax_scale = 1. / (attention_head_size as f64).sqrt();
 
         Ok(Self {
             query_proj,
             key_proj,
             value_proj,
             pos_att_type,
-            max_relative_positions: config.max_relative_positions.unwrap_or(256),
-            position_buckets: config.position_buckets.unwrap_or(256),
+            max_relative_positions,
+            position_buckets: config.position_buckets.unwrap_or(-1),
             share_att_key,
             pos_key_proj,
             pos_query_proj,
@@ -233,11 +224,11 @@ impl DeBertaDisentangledSelfAttention {
             attention_head_size,
             all_head_size,
             pos_dropout: config.hidden_dropout_prob,
-            softmax_scale,
             span: tracing::span!(tracing::Level::TRACE, "disentangled_self_attention"),
         })
     }
 
+    // CORRECTED: This function now reshapes the final context layer from 3D back to the expected shape.
     fn forward(
         &self,
         hidden_states: &Tensor,
@@ -246,69 +237,88 @@ impl DeBertaDisentangledSelfAttention {
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let (batch_size, seq_len, _) = hidden_states.dims3()?;
 
-        // Project to query, key, value
         let query_layer = self.query_proj.forward(hidden_states)?;
         let key_layer = self.key_proj.forward(hidden_states)?;
         let value_layer = self.value_proj.forward(hidden_states)?;
-
-        // Reshape and transpose for attention computation
-        let (batch_size, seq_len, _) = hidden_states.dims3()?;
 
         let query_layer = self.transpose_for_scores(&query_layer, batch_size, seq_len)?;
         let key_layer = self.transpose_for_scores(&key_layer, batch_size, seq_len)?;
         let value_layer = self.transpose_for_scores(&value_layer, batch_size, seq_len)?;
 
-        // Compute attention scores
-        let key_layer_t = key_layer.transpose(2, 3)?;
-        let attention_scores = query_layer.matmul(&key_layer_t)?;
-        let mut attention_scores = (attention_scores * self.softmax_scale)?;
+        let mut scale_factor = 1.0;
+        if self.pos_att_type.contains(&"c2p".to_string()) {
+            scale_factor += 1.0;
+        }
+        if self.pos_att_type.contains(&"p2c".to_string()) {
+            scale_factor += 1.0;
+        }
+        let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
 
-        // Add relative attention bias if available
-        if self.pos_att_type.len() > 0 && relative_embeddings.is_some() && relative_pos.is_some() {
+        let mut attention_scores = query_layer.matmul(&key_layer.t()?)?;
+
+        if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
             let rel_att = self.disentangled_attention_bias(
                 &query_layer,
                 &key_layer,
-                relative_pos.unwrap(),
-                relative_embeddings.unwrap(),
+                relative_pos,
+                rel_embeddings,
             )?;
-            attention_scores = attention_scores.broadcast_add(&rel_att)?;
+            attention_scores = attention_scores.add(&rel_att)?;
         }
 
-        let attention_scores = if let Some(attention_mask) = attention_mask {
-            attention_scores.broadcast_add(attention_mask)?
-        } else {
-            attention_scores
-        };
+        attention_scores = (attention_scores / scale)?;
+
+        if let Some(attention_mask) = attention_mask {
+            // The attention mask is [bs, 1, 1, k_len]. It needs to be [bs*n_head, 1, k_len]
+            let (b, _, _, k) = attention_mask.dims4()?;
+            let attention_mask = attention_mask.reshape((b, k))?.unsqueeze(1)?.repeat((
+                self.num_attention_heads,
+                1,
+                1,
+            ))?;
+            attention_scores = attention_scores.broadcast_add(&attention_mask)?
+        }
 
         let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
-
-        // Apply attention to values
         let context_layer = attention_probs.matmul(&value_layer)?;
 
-        // Transpose back and reshape
-        let context_layer = context_layer.transpose(1, 2)?;
-        let context_layer = context_layer.contiguous()?;
-        let context_layer = context_layer.reshape((batch_size, seq_len, self.all_head_size))?;
-
-        Ok(context_layer)
+        // Reshape context layer from [bs*n_head, q_len, d_head] back to [bs, q_len, hidden_size]
+        context_layer
+            .reshape((
+                batch_size,
+                self.num_attention_heads,
+                seq_len,
+                self.attention_head_size,
+            ))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch_size, seq_len, self.all_head_size))
     }
 
+    // CORRECTED: Reshapes to 3D tensor [batch*heads, seq_len, head_size] to avoid Metal issues with 4D matmul.
     fn transpose_for_scores(
         &self,
         x: &Tensor,
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        let x = x.reshape((
+        x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
-        ))?;
-        x.transpose(1, 2)?.contiguous()
+        ))?
+        .transpose(1, 2)?
+        .reshape((
+            batch_size * self.num_attention_heads,
+            seq_len,
+            self.attention_head_size,
+        ))
     }
 
+    // CORRECTED: This function is rewritten to work with 3D tensors, which is more robust.
     fn disentangled_attention_bias(
         &self,
         query_layer: &Tensor,
@@ -316,21 +326,91 @@ impl DeBertaDisentangledSelfAttention {
         relative_pos: &Tensor,
         rel_embeddings: &Tensor,
     ) -> Result<Tensor> {
-        // FIXME: Implement
-        let device = query_layer.device();
-        let dtype = query_layer.dtype();
+        let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
+        let k_len = key_layer.dim(1)?;
+        let bs = total_bs_heads / self.num_attention_heads;
+        let n_head = self.num_attention_heads;
 
-        // FIXME: Implement
-        Tensor::zeros(
+        let att_span = if self.position_buckets > 0 {
+            self.position_buckets
+        } else {
+            self.max_relative_positions
+        };
+        if att_span <= 0 {
+            bail!("att_span must be a positive integer, but got {}", att_span);
+        }
+
+        // `relative_pos` is [bs, q_len, k_len]. Repeat it for each head.
+        let relative_pos = relative_pos
+            .unsqueeze(1)? // [bs, 1, q_len, k_len]
+            .repeat((1, n_head, 1, 1))? // [bs, n_head, q_len, k_len]
+            .reshape((total_bs_heads, q_len, k_len))?; // [bs*n_head, q_len, k_len]
+
+        let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
+
+        let (pos_query_layer, pos_key_layer) = if self.share_att_key {
             (
-                query_layer.dim(0)?,
-                query_layer.dim(1)?,
-                query_layer.dim(2)?,
-                key_layer.dim(2)?,
-            ),
-            dtype,
-            device,
-        )
+                Some(self.query_proj.forward(&rel_embeddings)?),
+                Some(self.key_proj.forward(&rel_embeddings)?),
+            )
+        } else {
+            (
+                self.pos_query_proj
+                    .as_ref()
+                    .map(|l| l.forward(&rel_embeddings))
+                    .transpose()?,
+                self.pos_key_proj
+                    .as_ref()
+                    .map(|l| l.forward(&rel_embeddings))
+                    .transpose()?,
+            )
+        };
+
+        let mut score = Tensor::zeros(
+            (total_bs_heads, q_len, k_len),
+            query_layer.dtype(),
+            query_layer.device(),
+        )?;
+
+        if self.pos_att_type.contains(&"c2p".to_string()) {
+            let p_key = pos_key_layer
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("pos_key_proj not found for c2p".to_string()))?;
+            let pos_key_layer = p_key
+                .reshape((1, 2 * att_span as usize, n_head, d_head))?
+                .transpose(1, 2)?
+                .reshape((n_head, 2 * att_span as usize, d_head))?; // [n_head, 2*span, d_head]
+
+            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?; // [bs*n_head, q_len, 2*span]
+
+            let c2p_pos = (relative_pos.add(&Tensor::new(att_span, query_layer.device())?)?)
+                .clamp(0i64, 2 * att_span - 1)?
+                .to_dtype(DType::U32)?;
+
+            let c2p_att = c2p_att.gather(&c2p_pos, 2)?;
+            score = score.add(&c2p_att)?;
+        }
+
+        if self.pos_att_type.contains(&"p2c".to_string()) {
+            let p_query = pos_query_layer.as_ref().ok_or_else(|| {
+                candle::Error::Msg("pos_query_proj not found for p2c".to_string())
+            })?;
+            let pos_query_layer = p_query
+                .reshape((1, 2 * att_span as usize, n_head, d_head))?
+                .transpose(1, 2)?
+                .reshape((n_head, 2 * att_span as usize, d_head))?; // [n_head, 2*span, d_head]
+
+            let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?; // [n_head, 2*span, k_len]
+
+            let p2c_pos = (relative_pos.add(&Tensor::new(att_span, query_layer.device())?)?)
+                .clamp(0i64, 2 * att_span - 1)?
+                .to_dtype(DType::U32)?;
+
+            let p2c_att = p2c_att.gather(&p2c_pos.transpose(1, 2)?, 1)?;
+            score = score.add(&p2c_att)?;
+        }
+
+        Ok(score)
     }
 }
 
@@ -344,12 +424,10 @@ struct DeBertaAttention {
 impl DeBertaAttention {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
         let self_attention = DeBertaDisentangledSelfAttention::load(vb.pp("self"), config)?;
-
         let dense = Linear::new(
             vb.pp("output")
                 .pp("dense")
-                .get((config.hidden_size, config.hidden_size), "weight")?
-                .transpose(0, 1)?,
+                .get((config.hidden_size, config.hidden_size), "weight")?,
             Some(
                 vb.pp("output")
                     .pp("dense")
@@ -357,13 +435,11 @@ impl DeBertaAttention {
             ),
             None,
         );
-
         let layer_norm = LayerNorm::load(
             vb.pp("output").pp("LayerNorm"),
             config.hidden_size,
             config.layer_norm_eps as f32,
         )?;
-
         Ok(Self {
             self_attention,
             dense,
@@ -380,7 +456,6 @@ impl DeBertaAttention {
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-
         let self_output = self.self_attention.forward(
             hidden_states,
             attention_mask,
@@ -388,11 +463,8 @@ impl DeBertaAttention {
             relative_pos,
         )?;
         let attention_output = self.dense.forward(&self_output)?;
-        let attention_output = self
-            .layer_norm
-            .forward(&attention_output, Some(hidden_states))?;
-
-        Ok(attention_output)
+        self.layer_norm
+            .forward(&attention_output, Some(hidden_states))
     }
 }
 
@@ -407,7 +479,6 @@ struct DeBertaLayer {
 impl DeBertaLayer {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
         let attention = DeBertaAttention::load(vb.pp("attention"), config)?;
-
         let intermediate = Linear::new(
             vb.pp("intermediate")
                 .pp("dense")
@@ -419,7 +490,6 @@ impl DeBertaLayer {
             ),
             Some(config.hidden_act.clone()),
         );
-
         let output = Linear::new(
             vb.pp("output")
                 .pp("dense")
@@ -431,13 +501,11 @@ impl DeBertaLayer {
             ),
             None,
         );
-
         let layer_norm = LayerNorm::load(
             vb.pp("output").pp("LayerNorm"),
             config.hidden_size,
             config.layer_norm_eps as f32,
         )?;
-
         Ok(Self {
             attention,
             intermediate,
@@ -455,7 +523,6 @@ impl DeBertaLayer {
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-
         let attention_output = self.attention.forward(
             hidden_states,
             attention_mask,
@@ -464,47 +531,34 @@ impl DeBertaLayer {
         )?;
         let intermediate_output = self.intermediate.forward(&attention_output)?;
         let layer_output = self.output.forward(&intermediate_output)?;
-        let layer_output = self
-            .layer_norm
-            .forward(&layer_output, Some(&attention_output))?;
-
-        Ok(layer_output)
+        self.layer_norm
+            .forward(&layer_output, Some(&attention_output))
     }
 }
 
 struct DeBertaRelativeEmbeddings {
     embeddings: Embedding,
-    dropout: f64,
-    max_relative_positions: i64,
-    position_buckets: i64,
     span: tracing::Span,
 }
 
 impl DeBertaRelativeEmbeddings {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
-        let max_relative_positions = config.max_relative_positions.unwrap_or(256);
-        let position_buckets = config.position_buckets.unwrap_or(256);
-
-        // When max_relative_positions is -1, use position_buckets
-        let embedding_size = if max_relative_positions < 1 {
-            position_buckets as usize
+        let mut max_relative_positions = config.max_relative_positions.unwrap_or(-1);
+        if max_relative_positions < 1 {
+            max_relative_positions = config.max_position_embeddings as i64;
+        }
+        let position_buckets = config.position_buckets.unwrap_or(-1);
+        let pos_ebd_size = if position_buckets > 0 {
+            position_buckets * 2
         } else {
-            max_relative_positions as usize
+            max_relative_positions * 2
         };
-
-        let hidden_size = config.hidden_size;
-
-        // DeBERTa uses 2x the size for positive and negative positions
         let embeddings = Embedding::new(
-            vb.get((embedding_size * 2, hidden_size), "weight")?,
-            hidden_size,
+            vb.get((pos_ebd_size as usize, config.hidden_size), "weight")?,
+            config.hidden_size,
         );
-
         Ok(Self {
             embeddings,
-            dropout: config.hidden_dropout_prob,
-            max_relative_positions: embedding_size as i64,
-            position_buckets,
             span: tracing::span!(tracing::Level::TRACE, "relative_embeddings"),
         })
     }
@@ -516,20 +570,18 @@ impl DeBertaRelativeEmbeddings {
 
 struct DeBertaEncoder {
     layers: Vec<DeBertaLayer>,
-    relative_attention: Option<DeBertaRelativeEmbeddings>,
+    relative_attention_layer: Option<DeBertaRelativeEmbeddings>,
     layer_norm: Option<LayerNorm>,
-    relative_attention_enabled: bool,
+    relative_attention: bool,
     span: tracing::Span,
 }
 
 impl DeBertaEncoder {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(DeBertaLayer::load(vb.pp(&format!("layer.{}", i)), config)?);
-        }
-
-        let relative_attention = if config.relative_attention {
+        let layers = (0..config.num_hidden_layers)
+            .map(|i| DeBertaLayer::load(vb.pp(&format!("layer.{}", i)), config))
+            .collect::<Result<Vec<_>>>()?;
+        let relative_attention_layer = if config.relative_attention {
             Some(DeBertaRelativeEmbeddings::load(
                 vb.pp("rel_embeddings"),
                 config,
@@ -537,65 +589,60 @@ impl DeBertaEncoder {
         } else {
             None
         };
-
-        let norm_rel_ebd = config
-            .norm_rel_ebd
-            .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("none");
+        let norm_rel_ebd = config.norm_rel_ebd.as_deref().unwrap_or("none");
         let layer_norm = if norm_rel_ebd.contains("layer_norm") {
-            match LayerNorm::load(
+            LayerNorm::load(
                 vb.pp("LayerNorm"),
                 config.hidden_size,
                 config.layer_norm_eps as f32,
-            ) {
-                Ok(ln) => Some(ln),
-                Err(_) => None,
-            }
+            )
+            .ok()
         } else {
             None
         };
-
         Ok(Self {
             layers,
-            relative_attention,
+            relative_attention_layer,
             layer_norm,
-            relative_attention_enabled: config.relative_attention,
+            relative_attention: config.relative_attention,
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let mut current_hidden_states = hidden_states.clone();
+        let (q_len, k_len) = (hidden_states.dim(1)?, hidden_states.dim(1)?);
 
-        let mut hidden_states = hidden_states.clone();
-
-        let (relative_embeddings, relative_pos) = if self.relative_attention_enabled {
-            if let Some(ref relative_attention) = self.relative_attention {
-                let rel_emb = relative_attention.get_rel_embedding()?;
-                let rel_emb = if let Some(ref layer_norm) = self.layer_norm {
-                    layer_norm.forward(&rel_emb, None)?
-                } else {
-                    rel_emb
-                };
-                (Some(rel_emb), None) // You'll need to implement relative position calculation
-            } else {
-                (None, None)
-            }
+        let relative_pos = if self.relative_attention {
+            Some(build_relative_position(
+                q_len,
+                k_len,
+                hidden_states.device(),
+            )?)
         } else {
-            (None, None)
+            None
+        };
+
+        let relative_embeddings = if let Some(rel_attn_layer) = &self.relative_attention_layer {
+            let mut embeddings = rel_attn_layer.get_rel_embedding()?;
+            if let Some(ln) = &self.layer_norm {
+                embeddings = ln.forward(&embeddings, None)?;
+            }
+            Some(embeddings)
+        } else {
+            None
         };
 
         for layer in &self.layers {
-            hidden_states = layer.forward(
-                &hidden_states,
+            current_hidden_states = layer.forward(
+                &current_hidden_states,
                 attention_mask,
                 relative_embeddings.as_ref(),
                 relative_pos.as_ref(),
             )?;
         }
-
-        Ok(hidden_states)
+        Ok(current_hidden_states)
     }
 }
 
@@ -608,12 +655,10 @@ impl DeBertaPooler {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
         let dense = Linear::new(
             vb.pp("dense")
-                .get((config.hidden_size, config.hidden_size), "weight")?
-                .transpose(0, 1)?,
+                .get((config.hidden_size, config.hidden_size), "weight")?,
             Some(vb.pp("dense").get(config.hidden_size, "bias")?),
             None,
         );
-
         Ok(Self {
             dense,
             span: tracing::span!(tracing::Level::TRACE, "pooler"),
@@ -622,11 +667,8 @@ impl DeBertaPooler {
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-
-        // Pool the first token (CLS token) representation
         let first_token = hidden_states.i((.., 0))?;
         let pooled = self.dense.forward(&first_token)?;
-        // Apply tanh activation
         pooled.tanh()
     }
 }
@@ -643,18 +685,14 @@ impl DeBertaContextPooler {
         let pooler_hidden_size = config.pooler_hidden_size.ok_or_else(|| {
             candle::Error::Msg("pooler_hidden_size is required for context pooler".to_string())
         })?;
-
         let dense = Linear::new(
             vb.pp("dense")
-                .get((pooler_hidden_size, pooler_hidden_size), "weight")?
-                .transpose(0, 1)?,
+                .get((pooler_hidden_size, pooler_hidden_size), "weight")?,
             Some(vb.pp("dense").get(pooler_hidden_size, "bias")?),
             None,
         );
-
         let dropout = config.pooler_dropout.unwrap_or(config.hidden_dropout_prob);
         let activation = config.pooler_hidden_act.clone().unwrap_or(HiddenAct::Gelu);
-
         Ok(Self {
             dense,
             dropout,
@@ -665,18 +703,13 @@ impl DeBertaContextPooler {
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-
-        // Take the first token
         let context_token = hidden_states.i((.., 0))?;
         let pooled = self.dense.forward(&context_token)?;
-
-        // Apply activation based on the configured type
         match self.activation {
             HiddenAct::Gelu => pooled.gelu(),
             HiddenAct::Relu => pooled.relu(),
             HiddenAct::Silu => pooled.silu(),
             HiddenAct::Swiglu => {
-                // Swiglu is not typically used for pooler activation in DeBERTa
                 candle::bail!("Swiglu activation is not supported for DeBERTa context pooler")
             }
         }
@@ -684,7 +717,6 @@ impl DeBertaContextPooler {
 }
 
 pub struct DeBertaClassificationHead {
-    dropout: f64,
     classifier: Linear,
     span: tracing::Span,
 }
@@ -692,21 +724,16 @@ pub struct DeBertaClassificationHead {
 impl DeBertaClassificationHead {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
         let n_classes = match &config.id2label {
-            None => candle::bail!("`id2label` must be set for classifier models"),
+            None => bail!("`id2label` must be set for classifier models"),
             Some(id2label) => id2label.len(),
         };
-
         let classifier = Linear::new(
             vb.pp("classifier")
                 .get((n_classes, config.hidden_size), "weight")?,
             Some(vb.pp("classifier").get(n_classes, "bias")?),
             None,
         );
-
         Ok(Self {
-            dropout: config
-                .classifier_dropout
-                .unwrap_or(config.hidden_dropout_prob),
             classifier,
             span: tracing::span!(tracing::Level::TRACE, "classifier"),
         })
@@ -724,11 +751,8 @@ pub struct DeBertaModel {
     pooler: Option<DeBertaPooler>,
     pool: Pool,
     classifier: Option<DeBertaClassificationHead>,
-
-    num_attention_heads: usize,
     device: Device,
     dtype: DType,
-
     span: tracing::Span,
 }
 
@@ -746,95 +770,83 @@ impl DeBertaModel {
                 (pool, None)
             }
         };
-
         let embeddings = DeBertaEmbeddings::load(vb.pp("deberta.embeddings"), config)?;
         let encoder = DeBertaEncoder::load(vb.pp("deberta.encoder"), config)?;
-
-        // Pooler might be at root level (not under deberta)
         let pooler = if classifier.is_none() {
-            match DeBertaPooler::load(vb.pp("pooler"), config) {
-                Ok(pooler) => Some(pooler),
-                Err(_) => {
-                    // Try under deberta
-                    match DeBertaPooler::load(vb.pp("deberta.pooler"), config) {
-                        Ok(pooler) => Some(pooler),
-                        Err(_) => None,
-                    }
-                }
-            }
+            DeBertaPooler::load(vb.pp("pooler"), config)
+                .or_else(|_| DeBertaPooler::load(vb.pp("deberta.pooler"), config))
+                .ok()
         } else {
             None
         };
-
         Ok(Self {
             embeddings,
             encoder,
             pooler,
             pool,
             classifier,
-            num_attention_heads: config.num_attention_heads,
             device: vb.device().clone(),
             dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
     }
 
-    // Rest of the implementation remains the same...
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let _enter = self.span.enter();
-
-        let batch_size = batch.len();
+        let batch_len = batch.len();
         let max_length = batch.max_length as usize;
-
-        let (input_ids, type_ids, position_ids, input_lengths, attention_bias, attention_mask) =
-            self.prepare_batch(&batch)?;
-
-        let shape = (batch_size, max_length);
-        let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
-        let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
-        let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
-
+        let mut input_lengths = Vec::with_capacity(batch_len);
+        for i in 0..batch_len {
+            let length = batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i];
+            input_lengths.push(length as f32);
+        }
+        let (_, _, _, _, attention_bias, attention_mask) =
+            self.prepare_batch(&batch, &input_lengths)?;
+        let shape = (batch_len, max_length);
+        let input_ids = Tensor::from_vec(batch.input_ids.clone(), shape, &self.device)?;
+        let type_ids = Tensor::from_vec(batch.token_type_ids.clone(), shape, &self.device)?;
+        let position_ids = Tensor::from_vec(batch.position_ids.clone(), shape, &self.device)?;
         let embedding_output = self
             .embeddings
             .forward(&input_ids, &type_ids, &position_ids)?;
-
         let encoder_output = self
             .encoder
             .forward(&embedding_output, attention_bias.as_ref())?;
-
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
-
+        let input_lengths_tensor =
+            Tensor::from_vec(input_lengths.clone(), (batch_len, 1), &self.device)?
+                .to_dtype(self.dtype)?;
         let pooled_embeddings = if has_pooling_requests {
             self.pool_embeddings(
                 encoder_output.clone(),
                 &batch,
                 attention_mask.as_ref(),
-                input_lengths,
+                input_lengths_tensor,
                 has_raw_requests,
             )?
         } else {
             None
         };
-
         let raw_embeddings = if has_raw_requests {
             self.get_raw_embeddings(
                 encoder_output,
                 &batch,
-                batch_size,
+                &input_lengths,
+                batch_len,
                 max_length,
                 has_pooling_requests,
             )?
         } else {
             None
         };
-
         Ok((pooled_embeddings, raw_embeddings))
     }
 
     fn prepare_batch(
         &self,
         batch: &Batch,
+        input_lengths: &[f32],
     ) -> Result<(
         Vec<u32>,
         Vec<u32>,
@@ -845,50 +857,30 @@ impl DeBertaModel {
     )> {
         let batch_size = batch.len();
         let max_length = batch.max_length as usize;
-
         if batch_size > 1 {
-            let elems = batch_size * max_length;
-
-            let mut input_ids = Vec::with_capacity(elems);
-            let mut type_ids = Vec::with_capacity(elems);
-            let mut position_ids = Vec::with_capacity(elems);
-            let mut attention_mask = Vec::with_capacity(elems);
-            let mut attention_bias = Vec::with_capacity(elems);
-            let mut input_lengths = Vec::with_capacity(batch_size);
+            let mut attention_mask = Vec::with_capacity(batch_size * max_length);
+            let mut attention_bias = Vec::with_capacity(batch_size * max_length);
             let mut masking = false;
-
-            for i in 0..batch_size {
-                let start = batch.cumulative_seq_lengths[i] as usize;
-                let end = batch.cumulative_seq_lengths[i + 1] as usize;
-                let seq_length = (end - start) as u32;
-                input_lengths.push(seq_length as f32);
-
-                for j in start..end {
-                    input_ids.push(batch.input_ids[j]);
-                    type_ids.push(batch.token_type_ids[j]);
-                    position_ids.push(batch.position_ids[j]);
+            for &length in input_lengths.iter() {
+                let seq_length = length as usize;
+                for _ in 0..seq_length {
                     attention_mask.push(1.0_f32);
-                    attention_bias.push(0.0);
+                    attention_bias.push(0.0_f32);
                 }
-
-                let padding = batch.max_length - seq_length;
+                let padding = max_length - seq_length;
                 if padding > 0 {
                     masking = true;
                     for _ in 0..padding {
-                        input_ids.push(0);
-                        type_ids.push(0);
-                        position_ids.push(0);
                         attention_mask.push(0.0_f32);
                         attention_bias.push(f32::NEG_INFINITY);
                     }
                 }
             }
-
-            let input_lengths = Tensor::from_vec(input_lengths, (batch_size, 1), &self.device)?
-                .to_dtype(self.dtype)?;
-
-            let (attention_bias, attention_mask) = if masking {
-                let attention_mask = if self.pool == Pool::Mean {
+            let input_lengths_tensor =
+                Tensor::from_vec(input_lengths.to_vec(), (batch_size, 1), &self.device)?
+                    .to_dtype(self.dtype)?;
+            let (attention_bias, attention_mask_tensor) = if masking {
+                let attention_mask_tensor = if self.pool == Pool::Mean {
                     Some(
                         Tensor::from_vec(
                             attention_mask,
@@ -900,38 +892,30 @@ impl DeBertaModel {
                 } else {
                     None
                 };
-
-                let attention_bias =
+                let attention_bias_tensor =
                     Tensor::from_vec(attention_bias, (batch_size, 1, 1, max_length), &self.device)?
                         .to_dtype(self.dtype)?;
-
-                let attention_bias = attention_bias
-                    .broadcast_as((batch_size, self.num_attention_heads, max_length, max_length))?
-                    .contiguous()?;
-
-                (Some(attention_bias), attention_mask)
+                (Some(attention_bias_tensor), attention_mask_tensor)
             } else {
                 (None, None)
             };
-
-            Ok((
-                input_ids,
-                type_ids,
-                position_ids,
-                input_lengths,
-                attention_bias,
-                attention_mask,
-            ))
-        } else {
-            let input_lengths =
-                Tensor::from_vec(vec![batch.max_length as f32], (1, 1), &self.device)?
-                    .to_dtype(self.dtype)?;
-
             Ok((
                 batch.input_ids.clone(),
                 batch.token_type_ids.clone(),
                 batch.position_ids.clone(),
-                input_lengths,
+                input_lengths_tensor,
+                attention_bias,
+                attention_mask_tensor,
+            ))
+        } else {
+            let input_lengths_tensor =
+                Tensor::from_vec(input_lengths.to_vec(), (1, 1), &self.device)?
+                    .to_dtype(self.dtype)?;
+            Ok((
+                batch.input_ids.clone(),
+                batch.token_type_ids.clone(),
+                batch.position_ids.clone(),
+                input_lengths_tensor,
                 None,
                 None,
             ))
@@ -947,19 +931,17 @@ impl DeBertaModel {
         has_raw_requests: bool,
     ) -> Result<Option<Tensor>> {
         let pooled_indices_length = batch.pooled_indices.len();
-
-        let pooled_indices = if has_raw_requests {
-            let pooled_indices = Tensor::from_vec(
+        let pooled_indices = if has_raw_requests && pooled_indices_length > 0 {
+            let pooled_indices_tensor = Tensor::from_vec(
                 batch.pooled_indices.clone(),
                 pooled_indices_length,
                 &self.device,
             )?;
-            outputs = outputs.index_select(&pooled_indices, 0)?;
-            Some(pooled_indices)
+            outputs = outputs.index_select(&pooled_indices_tensor, 0)?;
+            Some(pooled_indices_tensor)
         } else {
             None
         };
-
         let pooled_embeddings = match self.pool {
             Pool::Cls => {
                 if let Some(ref pooler) = self.pooler {
@@ -969,9 +951,10 @@ impl DeBertaModel {
                 }
             }
             Pool::LastToken => {
-                candle::bail!("LastToken pooling is not supported for DeBERTa")
+                bail!("LastToken pooling is not supported for DeBERTa")
             }
             Pool::Mean => {
+                let mut outputs_for_pooling = outputs;
                 if let Some(attention_mask) = attention_mask {
                     let attention_mask = if let Some(pooled_indices) = pooled_indices {
                         input_lengths = input_lengths.index_select(&pooled_indices, 0)?;
@@ -979,15 +962,12 @@ impl DeBertaModel {
                     } else {
                         attention_mask.clone()
                     };
-
-                    outputs = outputs.broadcast_mul(&attention_mask)?;
+                    outputs_for_pooling = outputs_for_pooling.broadcast_mul(&attention_mask)?;
                 }
-
-                (outputs.sum(1)?.broadcast_div(&input_lengths))?
+                (outputs_for_pooling.sum(1)?.broadcast_div(&input_lengths))?
             }
             Pool::Splade => unreachable!(),
         };
-
         Ok(Some(pooled_embeddings))
     }
 
@@ -995,31 +975,27 @@ impl DeBertaModel {
         &self,
         outputs: Tensor,
         batch: &Batch,
+        input_lengths: &[f32],
         batch_size: usize,
         max_length: usize,
         has_pooling_requests: bool,
     ) -> Result<Option<Tensor>> {
-        let (b, l, h) = outputs.shape().dims3()?;
-        let outputs = outputs.reshape((b * l, h))?;
-
+        let (_b, _l, h) = outputs.shape().dims3()?;
+        let outputs = outputs.reshape((batch_size * max_length, h))?;
         if batch_size > 1 && has_pooling_requests {
             let mut final_indices: Vec<u32> = Vec::with_capacity(batch_size * max_length);
-
-            for i in batch.raw_indices.iter() {
-                let start = i * batch.max_length;
-                let i = *i as usize;
-                let length = batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i];
-
-                for j in start..start + length {
+            for &i_u32 in batch.raw_indices.iter() {
+                let i = i_u32 as usize;
+                let start = (i * max_length) as u32;
+                let length = input_lengths[i];
+                for j in start..(start + length as u32) {
                     final_indices.push(j);
                 }
             }
-
             let final_indices_length = final_indices.len();
-            let final_indices =
+            let final_indices_tensor =
                 Tensor::from_vec(final_indices, final_indices_length, &self.device)?;
-
-            Ok(Some(outputs.index_select(&final_indices, 0)?))
+            Ok(Some(outputs.index_select(&final_indices_tensor, 0)?))
         } else {
             Ok(Some(outputs))
         }
