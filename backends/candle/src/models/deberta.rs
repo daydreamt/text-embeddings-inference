@@ -52,25 +52,28 @@ impl DeBertaEmbeddings {
             config.hidden_size,
         );
 
-        // DeBERTa may not use absolute position embeddings
+        // DeBERTa v2 with relative attention typically doesn't use position embeddings
         let position_embeddings = if !config.relative_attention {
-            Some(Embedding::new(
-                vb.pp("position_embeddings").get(
-                    (config.max_position_embeddings, config.hidden_size),
-                    "weight",
-                )?,
-                config.hidden_size,
-            ))
+            match vb.pp("position_embeddings").get(
+                (config.max_position_embeddings, config.hidden_size),
+                "weight",
+            ) {
+                Ok(w) => Some(Embedding::new(w, config.hidden_size)),
+                Err(_) => None,
+            }
         } else {
             None
         };
 
+        // Only create token_type_embeddings if type_vocab_size > 0
         let token_type_embeddings = if config.type_vocab_size > 0 {
-            Some(Embedding::new(
-                vb.pp("token_type_embeddings")
-                    .get((config.type_vocab_size, config.hidden_size), "weight")?,
-                config.hidden_size,
-            ))
+            match vb
+                .pp("token_type_embeddings")
+                .get((config.type_vocab_size, config.hidden_size), "weight")
+            {
+                Ok(w) => Some(Embedding::new(w, config.hidden_size)),
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -179,7 +182,7 @@ impl DeBertaDisentangledSelfAttention {
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
-        relative_embeddings: &Tensor,
+        _relative_embeddings: &Tensor,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
 
@@ -370,6 +373,7 @@ impl DeBertaLayer {
 struct DeBertaEncoder {
     layers: Vec<DeBertaLayer>,
     relative_attention: Option<DeBertaRelativeEmbeddings>,
+    layer_norm: Option<LayerNorm>, // Add this field
     span: tracing::Span,
 }
 
@@ -380,6 +384,7 @@ impl DeBertaEncoder {
             layers.push(DeBertaLayer::load(vb.pp(&format!("layer.{}", i)), config)?);
         }
 
+        // rel_embeddings is directly under encoder, not nested deeper
         let relative_attention = if config.relative_attention {
             Some(DeBertaRelativeEmbeddings::load(
                 vb.pp("rel_embeddings"),
@@ -389,9 +394,19 @@ impl DeBertaEncoder {
             None
         };
 
+        let layer_norm = match LayerNorm::load(
+            vb.pp("LayerNorm"),
+            config.hidden_size,
+            config.layer_norm_eps as f32,
+        ) {
+            Ok(ln) => Some(ln),
+            Err(_) => None,
+        };
+
         Ok(Self {
             layers,
             relative_attention,
+            layer_norm,
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
@@ -401,16 +416,18 @@ impl DeBertaEncoder {
 
         let mut hidden_states = hidden_states.clone();
 
-        // Get relative embeddings if using relative attention
         let relative_embeddings = if let Some(ref relative_attention) = self.relative_attention {
             relative_attention.get_rel_embedding()?
         } else {
-            // Dummy tensor if not using relative attention
             Tensor::zeros((1, 1, 1), hidden_states.dtype(), hidden_states.device())?
         };
 
         for layer in &self.layers {
             hidden_states = layer.forward(&hidden_states, attention_mask, &relative_embeddings)?;
+        }
+
+        if let Some(ref layer_norm) = self.layer_norm {
+            hidden_states = layer_norm.forward(&hidden_states, None)?;
         }
 
         Ok(hidden_states)
@@ -459,22 +476,24 @@ struct DeBertaRelativeEmbeddings {
 
 impl DeBertaRelativeEmbeddings {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
-        let max_relative_positions = config.max_relative_positions.unwrap_or(256);
+        // When max_relative_positions is -1, use position_buckets
+        let embedding_size = match config.max_relative_positions {
+            Some(-1) | None => config.position_buckets.unwrap_or(256) as usize,
+            Some(n) => n as usize,
+        };
+
         let hidden_size = config.hidden_size;
 
-        //.pp("rel_embeddings").get(
-        //            (config.max_position_embeddings, config.hidden_size),
-        //            "weight",
-        //        )?,
+        // DeBERTa uses 2x the size for positive and negative positions
         let embeddings = Embedding::new(
-            vb.get((max_relative_positions as usize * 2, hidden_size), "weight")?,
+            vb.get((embedding_size * 2, hidden_size), "weight")?,
             hidden_size,
         );
 
         Ok(Self {
             embeddings,
             dropout: config.hidden_dropout_prob,
-            max_relative_positions,
+            max_relative_positions: embedding_size as i64,
             position_buckets: config.position_buckets.unwrap_or(256),
             span: tracing::span!(tracing::Level::TRACE, "relative_embeddings"),
         })
@@ -488,7 +507,6 @@ impl DeBertaRelativeEmbeddings {
 }
 
 pub struct DeBertaClassificationHead {
-    pooler: Option<Linear>,
     dropout: f64,
     classifier: Linear,
     span: tracing::Span,
@@ -501,19 +519,7 @@ impl DeBertaClassificationHead {
             Some(id2label) => id2label.len(),
         };
 
-        // DeBERTa uses a specific prefix for the classifier
-        let pooler = if let Ok(pooler_weight) = vb
-            .pp("deberta.pooler.dense")
-            .get((config.hidden_size, config.hidden_size), "weight")
-        {
-            let pooler_bias = vb
-                .pp("deberta.pooler.dense")
-                .get(config.hidden_size, "bias")?;
-            Some(Linear::new(pooler_weight, Some(pooler_bias), None))
-        } else {
-            None
-        };
-
+        // Classifier is at root level, not under deberta
         let output_weight = vb
             .pp("classifier")
             .get((n_classes, config.hidden_size), "weight")?;
@@ -521,7 +527,6 @@ impl DeBertaClassificationHead {
         let classifier = Linear::new(output_weight, Some(output_bias), None);
 
         Ok(Self {
-            pooler,
             dropout: config
                 .classifier_dropout
                 .unwrap_or(config.hidden_dropout_prob),
@@ -533,15 +538,10 @@ impl DeBertaClassificationHead {
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
 
-        let mut pooled = hidden_states.i((.., 0))?.unsqueeze(1)?;
-
-        if let Some(ref pooler) = self.pooler {
-            pooled = pooler.forward(&pooled)?;
-            pooled = pooled.tanh()?;
-        }
-
+        // Use CLS token (first token) directly
+        let pooled = hidden_states.i((.., 0))?;
         let logits = self.classifier.forward(&pooled)?;
-        logits.squeeze(1)
+        Ok(logits)
     }
 }
 
@@ -577,8 +577,8 @@ impl DeBertaModel {
         let embeddings = DeBertaEmbeddings::load(vb.pp("deberta.embeddings"), config)?;
         let encoder = DeBertaEncoder::load(vb.pp("deberta.encoder"), config)?;
 
+        // Pooler might be at root level (not under deberta)
         let pooler = if classifier.is_none() {
-            // Try to load pooler for embedding models
             match DeBertaPooler::load(vb.pp("pooler"), config) {
                 Ok(pooler) => Some(pooler),
                 Err(_) => None,
@@ -610,23 +610,19 @@ impl DeBertaModel {
         let (input_ids, type_ids, position_ids, input_lengths, attention_bias, attention_mask) =
             self.prepare_batch(&batch)?;
 
-        // Create tensors
         let shape = (batch_size, max_length);
         let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
         let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
         let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
 
-        // Embeddings
         let embedding_output = self
             .embeddings
             .forward(&input_ids, &type_ids, &position_ids)?;
 
-        // Encoder
         let encoder_output = self
             .encoder
             .forward(&embedding_output, attention_bias.as_ref())?;
 
-        // Pooling
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
 
