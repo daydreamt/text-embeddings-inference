@@ -41,41 +41,6 @@ pub struct DeBertaConfig {
     pub pooler_hidden_size: Option<usize>,
 }
 
-impl Default for DeBertaConfig {
-    fn default() -> Self {
-        Self {
-            vocab_size: 128100,
-            hidden_size: 768,
-            num_hidden_layers: 12,
-            num_attention_heads: 12,
-            intermediate_size: 3072,
-            hidden_act: HiddenAct::Gelu, // DeBERTa uses GELU activation
-            hidden_dropout_prob: 0.1,
-            attention_probs_dropout_prob: 0.1,
-            max_position_embeddings: 512,
-            type_vocab_size: 0,
-            initializer_range: 0.02,
-            layer_norm_eps: 1e-7,
-            pad_token_id: Some(0),
-            position_embedding_type: Some("absolute".to_string()),
-            use_cache: Some(true),
-            classifier_dropout: None,
-            id2label: None,
-            label2id: None,
-            relative_attention: true,
-            pos_att_type: Some(vec!["p2c".to_string(), "c2p".to_string()]),
-            max_relative_positions: Some(256),
-            position_buckets: Some(256),
-            share_att_key: Some(true),
-            norm_rel_ebd: Some("none".to_string()),
-            attention_head_size: None,
-            position_biased_input: Some(true),
-            pooler_dropout: None,
-            pooler_hidden_act: None,
-            pooler_hidden_size: None,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct DeBertaEmbeddings {
@@ -247,9 +212,11 @@ impl DeBertaDisentangledSelfAttention {
 
             (pos_key_proj, pos_query_proj)
         } else {
+            // FIXME: Case where share_att_key
             (None, None)
         };
 
+        // FIXME: It's 3 in the paper if we have p2c and c2p
         let softmax_scale = 1. / (attention_head_size as f64).sqrt();
 
         Ok(Self {
