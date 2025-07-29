@@ -228,7 +228,6 @@ impl DeBertaDisentangledSelfAttention {
         })
     }
 
-    // CORRECTED: This function now reshapes the final context layer from 3D back to the expected shape.
     fn forward(
         &self,
         hidden_states: &Tensor,
@@ -271,7 +270,6 @@ impl DeBertaDisentangledSelfAttention {
         attention_scores = (attention_scores / scale)?;
 
         if let Some(attention_mask) = attention_mask {
-            // The attention mask is [bs, 1, 1, k_len]. It needs to be [bs*n_head, 1, k_len]
             let (b, _, _, k) = attention_mask.dims4()?;
             let attention_mask = attention_mask.reshape((b, k))?.unsqueeze(1)?.repeat((
                 self.num_attention_heads,
@@ -284,7 +282,6 @@ impl DeBertaDisentangledSelfAttention {
         let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
         let context_layer = attention_probs.matmul(&value_layer)?;
 
-        // Reshape context layer from [bs*n_head, q_len, d_head] back to [bs, q_len, hidden_size]
         context_layer
             .reshape((
                 batch_size,
@@ -297,7 +294,6 @@ impl DeBertaDisentangledSelfAttention {
             .reshape((batch_size, seq_len, self.all_head_size))
     }
 
-    // CORRECTED: Reshapes to 3D tensor [batch*heads, seq_len, head_size] to avoid Metal issues with 4D matmul.
     fn transpose_for_scores(
         &self,
         x: &Tensor,
@@ -311,6 +307,7 @@ impl DeBertaDisentangledSelfAttention {
             self.attention_head_size,
         ))?
         .transpose(1, 2)?
+        .contiguous()?
         .reshape((
             batch_size * self.num_attention_heads,
             seq_len,
@@ -318,7 +315,6 @@ impl DeBertaDisentangledSelfAttention {
         ))
     }
 
-    // CORRECTED: This function is rewritten to work with 3D tensors, which is more robust.
     fn disentangled_attention_bias(
         &self,
         query_layer: &Tensor,
@@ -328,8 +324,8 @@ impl DeBertaDisentangledSelfAttention {
     ) -> Result<Tensor> {
         let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
         let k_len = key_layer.dim(1)?;
-        let bs = total_bs_heads / self.num_attention_heads;
         let n_head = self.num_attention_heads;
+        let bs = total_bs_heads / n_head;
 
         let att_span = if self.position_buckets > 0 {
             self.position_buckets
@@ -340,15 +336,19 @@ impl DeBertaDisentangledSelfAttention {
             bail!("att_span must be a positive integer, but got {}", att_span);
         }
 
-        // `relative_pos` is [bs, q_len, k_len]. Repeat it for each head.
         let relative_pos = relative_pos
-            .unsqueeze(1)? // [bs, 1, q_len, k_len]
-            .repeat((1, n_head, 1, 1))? // [bs, n_head, q_len, k_len]
-            .reshape((total_bs_heads, q_len, k_len))?; // [bs*n_head, q_len, k_len]
+            .unsqueeze(1)?
+            .repeat((1, n_head, 1, 1))?
+            .reshape((total_bs_heads, q_len, k_len))?;
+
+        let pos_idx = (relative_pos
+            .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?)
+        .clamp(0i64, 2 * att_span - 1)?
+        .to_dtype(DType::U32)?;
 
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        let (pos_query_layer, pos_key_layer) = if self.share_att_key {
+        let (pos_query_layer_proj, pos_key_layer_proj) = if self.share_att_key {
             (
                 Some(self.query_proj.forward(&rel_embeddings)?),
                 Some(self.key_proj.forward(&rel_embeddings)?),
@@ -373,40 +373,43 @@ impl DeBertaDisentangledSelfAttention {
         )?;
 
         if self.pos_att_type.contains(&"c2p".to_string()) {
-            let p_key = pos_key_layer
+            let p_key = pos_key_layer_proj
                 .as_ref()
                 .ok_or_else(|| candle::Error::Msg("pos_key_proj not found for c2p".to_string()))?;
+
             let pos_key_layer = p_key
-                .reshape((1, 2 * att_span as usize, n_head, d_head))?
-                .transpose(1, 2)?
-                .reshape((n_head, 2 * att_span as usize, d_head))?; // [n_head, 2*span, d_head]
+                .reshape((2 * att_span as usize, n_head, d_head))?
+                .transpose(0, 1)?
+                .contiguous()?
+                .unsqueeze(0)?
+                .repeat((bs, 1, 1, 1))?
+                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
 
-            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?; // [bs*n_head, q_len, 2*span]
-
-            let c2p_pos = (relative_pos.add(&Tensor::new(att_span, query_layer.device())?)?)
-                .clamp(0i64, 2 * att_span - 1)?
-                .to_dtype(DType::U32)?;
-
-            let c2p_att = c2p_att.gather(&c2p_pos, 2)?;
+            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
+            let c2p_att = c2p_att.gather(&pos_idx, 2)?;
             score = score.add(&c2p_att)?;
         }
 
         if self.pos_att_type.contains(&"p2c".to_string()) {
-            let p_query = pos_query_layer.as_ref().ok_or_else(|| {
+            let p_query = pos_query_layer_proj.as_ref().ok_or_else(|| {
                 candle::Error::Msg("pos_query_proj not found for p2c".to_string())
             })?;
+
             let pos_query_layer = p_query
-                .reshape((1, 2 * att_span as usize, n_head, d_head))?
-                .transpose(1, 2)?
-                .reshape((n_head, 2 * att_span as usize, d_head))?; // [n_head, 2*span, d_head]
+                .reshape((2 * att_span as usize, n_head, d_head))?
+                .transpose(0, 1)?
+                .contiguous()?
+                .unsqueeze(0)?
+                .repeat((bs, 1, 1, 1))?
+                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
 
-            let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?; // [n_head, 2*span, k_len]
+            let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
 
-            let p2c_pos = (relative_pos.add(&Tensor::new(att_span, query_layer.device())?)?)
-                .clamp(0i64, 2 * att_span - 1)?
-                .to_dtype(DType::U32)?;
+            let p2c_att_transposed = p2c_att.transpose(1, 2)?;
+            let pos_idx_transposed = pos_idx.transpose(1, 2)?;
+            let gathered = p2c_att_transposed.gather(&pos_idx_transposed, 2)?;
+            let p2c_att = gathered.transpose(1, 2)?;
 
-            let p2c_att = p2c_att.gather(&p2c_pos.transpose(1, 2)?, 1)?;
             score = score.add(&p2c_att)?;
         }
 
