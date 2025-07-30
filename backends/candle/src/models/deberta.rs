@@ -569,6 +569,8 @@ struct DeBertaEncoder {
     relative_attention_layer: Option<DeBertaRelativeEmbeddings>,
     layer_norm: Option<LayerNorm>,
     relative_attention: bool,
+    position_buckets: i64,
+    max_relative_positions: i64,
     span: tracing::Span,
 }
 
@@ -596,11 +598,18 @@ impl DeBertaEncoder {
         } else {
             None
         };
+        let position_buckets = config.position_buckets.unwrap_or(-1);
+        let mut max_relative_positions = config.max_relative_positions.unwrap_or(-1);
+        if max_relative_positions < 1 {
+            max_relative_positions = config.max_position_embeddings as i64;
+        }
         Ok(Self {
             layers,
             relative_attention_layer,
             layer_norm,
             relative_attention: config.relative_attention,
+            position_buckets,
+            max_relative_positions,
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
@@ -611,11 +620,17 @@ impl DeBertaEncoder {
         let (q_len, k_len) = (hidden_states.dim(1)?, hidden_states.dim(1)?);
 
         let relative_pos = if self.relative_attention {
-            Some(build_relative_position(
-                q_len,
-                k_len,
-                hidden_states.device(),
-            )?)
+            let mut rel_pos = build_relative_position(q_len, k_len, hidden_states.device())?;
+            if self.position_buckets > 0 && self.max_relative_positions > 0 {
+                rel_pos = make_log_bucket_position(
+                    rel_pos,
+                    self.position_buckets.try_into().unwrap(),
+                    self.max_relative_positions.try_into().unwrap(),
+                    hidden_states.device(),
+                )?
+                .to_dtype(DType::I64)?;
+            }
+            Some(rel_pos)
         } else {
             None
         };
