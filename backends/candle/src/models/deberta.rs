@@ -300,25 +300,14 @@ impl DeBertaDisentangledSelfAttention {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        /*
-        println!("DEBUG transpose_for_scores:");
-        println!("  input shape: {:?}", x.shape());
-        println!("  batch_size: {}, seq_len: {}", batch_size, seq_len);
-        println!(
-            "  num_attention_heads: {}, attention_head_size: {}",
-            self.num_attention_heads, self.attention_head_size
-        );
-        */
         let reshaped = x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
         ))?;
-        // println!("  after first reshape: {:?}", reshaped.shape());
 
         let transposed = reshaped.transpose(1, 2)?;
-        // println!("  after transpose: {:?}", transposed.shape());
 
         let contiguous = transposed.contiguous()?;
 
@@ -327,7 +316,6 @@ impl DeBertaDisentangledSelfAttention {
             seq_len,
             self.attention_head_size,
         ))?;
-        // println!("  final shape: {:?}", final_shape.shape());
 
         Ok(final_shape)
     }
