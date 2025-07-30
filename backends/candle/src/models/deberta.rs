@@ -47,6 +47,13 @@ pub struct DeBertaConfig {
     pub pooler_dropout: Option<f64>,
     pub pooler_hidden_act: Option<HiddenAct>,
     pub pooler_hidden_size: Option<usize>,
+    // DeBERTa-v2 ConvLayer, which is not supported.
+    #[serde(default)]
+    pub conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    pub conv_groups: Option<usize>,
+    #[serde(default)]
+    pub conv_act: Option<String>,
 }
 
 #[derive(Debug)]
@@ -758,6 +765,15 @@ pub struct DeBertaModel {
 
 impl DeBertaModel {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig, model_type: ModelType) -> Result<Self> {
+        if config.conv_kernel_size.is_some()
+            || config.conv_groups.is_some()
+            || config.conv_act.is_some()
+        {
+            candle::bail!(
+                "Unsupported DeBERTa configuration: `conv_kernel_size`, `conv_groups`, or `conv_act` was found - not implemented!"
+            )
+        }
+
         let (pool, classifier) = match model_type {
             ModelType::Classifier => {
                 let classifier = DeBertaClassificationHead::load(vb.clone(), config)?;
