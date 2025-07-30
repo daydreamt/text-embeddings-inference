@@ -117,10 +117,8 @@ impl DeBertaEmbeddings {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let mut embeddings = self.word_embeddings.forward(input_ids)?;
-        if self.position_biased_input {
-            if let Some(ref position_embeddings) = self.position_embeddings {
-                embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
-            }
+        if let Some(ref position_embeddings) = self.position_embeddings {
+            embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
         }
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
@@ -300,24 +298,19 @@ impl DeBertaDisentangledSelfAttention {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        let reshaped = x.reshape((
+        x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
-        ))?;
-
-        let transposed = reshaped.transpose(1, 2)?;
-
-        let contiguous = transposed.contiguous()?;
-
-        let final_shape = contiguous.reshape((
+        ))?
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((
             batch_size * self.num_attention_heads,
             seq_len,
             self.attention_head_size,
-        ))?;
-
-        Ok(final_shape)
+        ))
     }
 
     fn disentangled_attention_bias(
@@ -341,16 +334,7 @@ impl DeBertaDisentangledSelfAttention {
             bail!("att_span must be a positive integer, but got {}", att_span);
         }
 
-        // Fix: Handle relative_pos reshape correctly for different batch sizes
-        let relative_pos = if bs == 1 {
-            // For batch_size = 1, just add the head dimension
-            relative_pos.unsqueeze(0)?.repeat((n_head, 1, 1))?
-        } else {
-            // For batch_size > 1, we need to handle it differently
-            // relative_pos is [q_len, k_len], we need [total_bs_heads, q_len, k_len]
-            relative_pos.unsqueeze(0)?.repeat((total_bs_heads, 1, 1))?
-        };
-
+        let relative_pos = relative_pos.unsqueeze(0)?.repeat((total_bs_heads, 1, 1))?;
         // The 'repeat' operation makes the tensor non-contiguous.
         // We ensure `pos_idx` is contiguous as it might be required by the gather kernel.
         let pos_idx = (relative_pos
