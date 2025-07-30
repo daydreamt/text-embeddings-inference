@@ -300,19 +300,35 @@ impl DeBertaDisentangledSelfAttention {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        x.reshape((
+        println!("DEBUG transpose_for_scores:");
+        println!("  input shape: {:?}", x.shape());
+        println!("  batch_size: {}, seq_len: {}", batch_size, seq_len);
+        println!(
+            "  num_attention_heads: {}, attention_head_size: {}",
+            self.num_attention_heads, self.attention_head_size
+        );
+
+        let reshaped = x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
-        ))?
-        .transpose(1, 2)?
-        .contiguous()?
-        .reshape((
+        ))?;
+        println!("  after first reshape: {:?}", reshaped.shape());
+
+        let transposed = reshaped.transpose(1, 2)?;
+        println!("  after transpose: {:?}", transposed.shape());
+
+        let contiguous = transposed.contiguous()?;
+
+        let final_shape = contiguous.reshape((
             batch_size * self.num_attention_heads,
             seq_len,
             self.attention_head_size,
-        ))
+        ))?;
+        println!("  final shape: {:?}", final_shape.shape());
+
+        Ok(final_shape)
     }
 
     fn disentangled_attention_bias(
@@ -348,29 +364,51 @@ impl DeBertaDisentangledSelfAttention {
 
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        // THE FIX: Unify the logic for creating positional query/key layers.
-        // This ensures they are always projected, transposed, made contiguous, and repeated for the batch.
-        let (pos_query_layer, pos_key_layer) = {
-            let (q_proj, k_proj) = if self.share_att_key {
-                (Some(&self.query_proj), Some(&self.key_proj))
-            } else {
-                (self.pos_query_proj.as_ref(), self.pos_key_proj.as_ref())
+        // Create positional query/key layers
+        // When share_att_key is true, we use the main query/key projections
+        // When false, we use the separate positional projections
+        let (pos_query_layer, pos_key_layer) = if self.share_att_key {
+            // Use the main query and key projections
+            let pos_query = {
+                let p_query = self.query_proj.forward(&rel_embeddings)?;
+                let p_query = p_query.unsqueeze(0)?;
+                let transposed = self.transpose_for_scores(&p_query, 1, 2 * att_span as usize)?;
+                transposed.repeat((bs, 1, 1))?
             };
 
-            let pos_key = if let Some(k_proj) = k_proj {
-                let p_key = k_proj.forward(&rel_embeddings)?;
+            let pos_key = {
+                let p_key = self.key_proj.forward(&rel_embeddings)?;
                 let p_key = p_key.unsqueeze(0)?;
                 let transposed = self.transpose_for_scores(&p_key, 1, 2 * att_span as usize)?;
-                Some(transposed.repeat((bs, 1, 1))?)
+                transposed.repeat((bs, 1, 1))?
+            };
+
+            (Some(pos_query), Some(pos_key))
+        } else {
+            // Use separate positional projections if they exist
+            let pos_key = if self.pos_att_type.iter().any(|t| t == "c2p" || t == "p2p") {
+                if let Some(ref k_proj) = self.pos_key_proj {
+                    let p_key = k_proj.forward(&rel_embeddings)?;
+                    let p_key = p_key.unsqueeze(0)?;
+                    let transposed = self.transpose_for_scores(&p_key, 1, 2 * att_span as usize)?;
+                    Some(transposed.repeat((bs, 1, 1))?)
+                } else {
+                    None
+                }
             } else {
                 None
             };
 
-            let pos_query = if let Some(q_proj) = q_proj {
-                let p_query = q_proj.forward(&rel_embeddings)?;
-                let p_query = p_query.unsqueeze(0)?;
-                let transposed = self.transpose_for_scores(&p_query, 1, 2 * att_span as usize)?;
-                Some(transposed.repeat((bs, 1, 1))?)
+            let pos_query = if self.pos_att_type.iter().any(|t| t == "p2c" || t == "p2p") {
+                if let Some(ref q_proj) = self.pos_query_proj {
+                    let p_query = q_proj.forward(&rel_embeddings)?;
+                    let p_query = p_query.unsqueeze(0)?;
+                    let transposed =
+                        self.transpose_for_scores(&p_query, 1, 2 * att_span as usize)?;
+                    Some(transposed.repeat((bs, 1, 1))?)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -387,7 +425,7 @@ impl DeBertaDisentangledSelfAttention {
         if self.pos_att_type.contains(&"c2p".to_string()) {
             let pos_key_layer = pos_key_layer
                 .as_ref()
-                .ok_or_else(|| candle::Error::Msg("pos_key_proj not found for c2p".to_string()))?;
+                .ok_or_else(|| candle::Error::Msg("pos_key_layer not found for c2p".to_string()))?;
 
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
             let c2p_att = c2p_att.gather(&pos_idx, 2)?;
@@ -399,11 +437,13 @@ impl DeBertaDisentangledSelfAttention {
                 candle::Error::Msg("pos_query_proj not found for p2c".to_string())
             })?;
 
+            // Key insight: The Python code shows that p2c_att is gathered differently
+            // We need to transpose the attention scores before gathering
             let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
-            let p2c_att_transposed = p2c_att.transpose(1, 2)?;
-            let pos_idx_transposed = pos_idx.transpose(1, 2)?;
-            let gathered = p2c_att_transposed.gather(&pos_idx_transposed, 2)?;
-            let p2c_att = gathered.transpose(1, 2)?;
+
+            // Gather along dimension 1 (the sequence dimension) after getting the scores
+            let c2p_pos = pos_idx.clone(); // Use the same indices as c2p
+            let p2c_att = p2c_att.gather(&c2p_pos, 1)?;
 
             score = score.add(&p2c_att)?;
         }
