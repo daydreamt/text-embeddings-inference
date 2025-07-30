@@ -300,6 +300,7 @@ impl DeBertaDisentangledSelfAttention {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
+        /*
         println!("DEBUG transpose_for_scores:");
         println!("  input shape: {:?}", x.shape());
         println!("  batch_size: {}, seq_len: {}", batch_size, seq_len);
@@ -307,17 +308,17 @@ impl DeBertaDisentangledSelfAttention {
             "  num_attention_heads: {}, attention_head_size: {}",
             self.num_attention_heads, self.attention_head_size
         );
-
+        */
         let reshaped = x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
         ))?;
-        println!("  after first reshape: {:?}", reshaped.shape());
+        // println!("  after first reshape: {:?}", reshaped.shape());
 
         let transposed = reshaped.transpose(1, 2)?;
-        println!("  after transpose: {:?}", transposed.shape());
+        // println!("  after transpose: {:?}", transposed.shape());
 
         let contiguous = transposed.contiguous()?;
 
@@ -326,7 +327,7 @@ impl DeBertaDisentangledSelfAttention {
             seq_len,
             self.attention_head_size,
         ))?;
-        println!("  final shape: {:?}", final_shape.shape());
+        // println!("  final shape: {:?}", final_shape.shape());
 
         Ok(final_shape)
     }
@@ -338,7 +339,7 @@ impl DeBertaDisentangledSelfAttention {
         relative_pos: &Tensor,
         rel_embeddings: &Tensor,
     ) -> Result<Tensor> {
-        let (total_bs_heads, q_len, _d_head) = query_layer.dims3()?;
+        let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
         let k_len = key_layer.dim(1)?;
         let n_head = self.num_attention_heads;
         let bs = total_bs_heads / n_head;
@@ -352,69 +353,25 @@ impl DeBertaDisentangledSelfAttention {
             bail!("att_span must be a positive integer, but got {}", att_span);
         }
 
-        let relative_pos = relative_pos
-            .unsqueeze(1)?
-            .repeat((1, n_head, 1, 1))?
-            .reshape((total_bs_heads, q_len, k_len))?;
+        // Fix: Handle relative_pos reshape correctly for different batch sizes
+        let relative_pos = if bs == 1 {
+            // For batch_size = 1, just add the head dimension
+            relative_pos.unsqueeze(0)?.repeat((n_head, 1, 1))?
+        } else {
+            // For batch_size > 1, we need to handle it differently
+            // relative_pos is [q_len, k_len], we need [total_bs_heads, q_len, k_len]
+            relative_pos.unsqueeze(0)?.repeat((total_bs_heads, 1, 1))?
+        };
 
+        // The 'repeat' operation makes the tensor non-contiguous.
+        // We ensure `pos_idx` is contiguous as it might be required by the gather kernel.
         let pos_idx = (relative_pos
             .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?)
         .clamp(0i64, 2 * att_span - 1)?
-        .to_dtype(DType::U32)?;
+        .to_dtype(DType::U32)?
+        .contiguous()?;
 
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
-
-        // Create positional query/key layers
-        // When share_att_key is true, we use the main query/key projections
-        // When false, we use the separate positional projections
-        let (pos_query_layer, pos_key_layer) = if self.share_att_key {
-            // Use the main query and key projections
-            let pos_query = {
-                let p_query = self.query_proj.forward(&rel_embeddings)?;
-                let p_query = p_query.unsqueeze(0)?;
-                let transposed = self.transpose_for_scores(&p_query, 1, 2 * att_span as usize)?;
-                transposed.repeat((bs, 1, 1))?
-            };
-
-            let pos_key = {
-                let p_key = self.key_proj.forward(&rel_embeddings)?;
-                let p_key = p_key.unsqueeze(0)?;
-                let transposed = self.transpose_for_scores(&p_key, 1, 2 * att_span as usize)?;
-                transposed.repeat((bs, 1, 1))?
-            };
-
-            (Some(pos_query), Some(pos_key))
-        } else {
-            // Use separate positional projections if they exist
-            let pos_key = if self.pos_att_type.iter().any(|t| t == "c2p" || t == "p2p") {
-                if let Some(ref k_proj) = self.pos_key_proj {
-                    let p_key = k_proj.forward(&rel_embeddings)?;
-                    let p_key = p_key.unsqueeze(0)?;
-                    let transposed = self.transpose_for_scores(&p_key, 1, 2 * att_span as usize)?;
-                    Some(transposed.repeat((bs, 1, 1))?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let pos_query = if self.pos_att_type.iter().any(|t| t == "p2c" || t == "p2p") {
-                if let Some(ref q_proj) = self.pos_query_proj {
-                    let p_query = q_proj.forward(&rel_embeddings)?;
-                    let p_query = p_query.unsqueeze(0)?;
-                    let transposed =
-                        self.transpose_for_scores(&p_query, 1, 2 * att_span as usize)?;
-                    Some(transposed.repeat((bs, 1, 1))?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            (pos_query, pos_key)
-        };
 
         let mut score = Tensor::zeros(
             (total_bs_heads, q_len, k_len),
@@ -423,28 +380,57 @@ impl DeBertaDisentangledSelfAttention {
         )?;
 
         if self.pos_att_type.contains(&"c2p".to_string()) {
-            let pos_key_layer = pos_key_layer
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("pos_key_layer not found for c2p".to_string()))?;
+            let pos_key = if self.share_att_key {
+                self.key_proj.forward(&rel_embeddings)?
+            } else {
+                match &self.pos_key_proj {
+                    Some(k_proj) => k_proj.forward(&rel_embeddings)?,
+                    None => return Err(candle::Error::Msg("pos_key_proj not found".to_string())),
+                }
+            };
+
+            // Reshape to [2*att_span, n_head, d_head] then transpose
+            let pos_key_layer = pos_key
+                .reshape((2 * att_span as usize, n_head, d_head))?
+                .transpose(0, 1)? // [n_head, 2*att_span, d_head]
+                .contiguous()?
+                .unsqueeze(0)? // [1, n_head, 2*att_span, d_head]
+                .repeat((bs, 1, 1, 1))? // [bs, n_head, 2*att_span, d_head]
+                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
 
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
-            let c2p_att = c2p_att.gather(&pos_idx, 2)?;
+            let c2p_att = c2p_att.contiguous()?.gather(&pos_idx, 2)?;
             score = score.add(&c2p_att)?;
         }
 
         if self.pos_att_type.contains(&"p2c".to_string()) {
-            let pos_query_layer = pos_query_layer.as_ref().ok_or_else(|| {
-                candle::Error::Msg("pos_query_proj not found for p2c".to_string())
-            })?;
+            let pos_query = if self.share_att_key {
+                self.query_proj.forward(&rel_embeddings)?
+            } else {
+                match &self.pos_query_proj {
+                    Some(q_proj) => q_proj.forward(&rel_embeddings)?,
+                    None => return Err(candle::Error::Msg("pos_query_proj not found".to_string())),
+                }
+            };
 
-            // Key insight: The Python code shows that p2c_att is gathered differently
-            // We need to transpose the attention scores before gathering
+            // Reshape to [2*att_span, n_head, d_head] then transpose
+            let pos_query_layer = pos_query
+                .reshape((2 * att_span as usize, n_head, d_head))?
+                .transpose(0, 1)? // [n_head, 2*att_span, d_head]
+                .contiguous()?
+                .unsqueeze(0)? // [1, n_head, 2*att_span, d_head]
+                .repeat((bs, 1, 1, 1))? // [bs, n_head, 2*att_span, d_head]
+                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
+
             let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
-
-            // Gather along dimension 1 (the sequence dimension) after getting the scores
-            let c2p_pos = pos_idx.clone(); // Use the same indices as c2p
-            let p2c_att = p2c_att.gather(&c2p_pos, 1)?;
-
+            let p2c_att_transposed = p2c_att.transpose(1, 2)?;
+            // A transpose on a contiguous tensor results in a non-contiguous one.
+            // We ensure it's contiguous before passing to gather.
+            let pos_idx_transposed = pos_idx.transpose(1, 2)?.contiguous()?;
+            let gathered = p2c_att_transposed
+                .contiguous()?
+                .gather(&pos_idx_transposed, 2)?;
+            let p2c_att = gathered.transpose(1, 2)?;
             score = score.add(&p2c_att)?;
         }
 
