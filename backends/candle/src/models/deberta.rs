@@ -669,50 +669,9 @@ impl DeBertaPooler {
     }
 }
 
-pub struct DeBertaContextPooler {
-    dense: Linear,
-    dropout: f64,
-    activation: HiddenAct,
-    span: tracing::Span,
-}
-
-impl DeBertaContextPooler {
-    pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
-        let pooler_hidden_size = config.pooler_hidden_size.ok_or_else(|| {
-            candle::Error::Msg("pooler_hidden_size is required for context pooler".to_string())
-        })?;
-        let dense = Linear::new(
-            vb.pp("dense")
-                .get((pooler_hidden_size, pooler_hidden_size), "weight")?,
-            Some(vb.pp("dense").get(pooler_hidden_size, "bias")?),
-            None,
-        );
-        let dropout = config.pooler_dropout.unwrap_or(config.hidden_dropout_prob);
-        let activation = config.pooler_hidden_act.clone().unwrap_or(HiddenAct::Gelu);
-        Ok(Self {
-            dense,
-            dropout,
-            activation,
-            span: tracing::span!(tracing::Level::TRACE, "context_pooler"),
-        })
-    }
-
-    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let context_token = hidden_states.i((.., 0))?;
-        let pooled = self.dense.forward(&context_token)?;
-        match self.activation {
-            HiddenAct::Gelu => pooled.gelu(),
-            HiddenAct::Relu => pooled.relu(),
-            HiddenAct::Silu => pooled.silu(),
-            HiddenAct::Swiglu => {
-                candle::bail!("Swiglu activation is not supported for DeBERTa context pooler")
-            }
-        }
-    }
-}
-
 pub struct DeBertaClassificationHead {
+    pooler_dense: Linear,
+    pooler_activation: HiddenAct,
     classifier: Linear,
     span: tracing::Span,
 }
@@ -723,13 +682,28 @@ impl DeBertaClassificationHead {
             None => bail!("`id2label` must be set for classifier models"),
             Some(id2label) => id2label.len(),
         };
+
+        let pooler_vb = vb.pp("pooler");
+        // In DeBERTa v2, pooler_hidden_size is typically the same as hidden_size.
+        let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
+        let pooler_dense = Linear::new(
+            pooler_vb
+                .pp("dense")
+                .get((pooler_hidden_size, config.hidden_size), "weight")?,
+            Some(pooler_vb.pp("dense").get(pooler_hidden_size, "bias")?),
+            None,
+        );
+        let pooler_activation = config.pooler_hidden_act.clone().unwrap_or(HiddenAct::Gelu);
+
         let classifier = Linear::new(
             vb.pp("classifier")
-                .get((n_classes, config.hidden_size), "weight")?,
+                .get((n_classes, pooler_hidden_size), "weight")?,
             Some(vb.pp("classifier").get(n_classes, "bias")?),
             None,
         );
         Ok(Self {
+            pooler_dense,
+            pooler_activation,
             classifier,
             span: tracing::span!(tracing::Level::TRACE, "classifier"),
         })
@@ -737,7 +711,22 @@ impl DeBertaClassificationHead {
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        self.classifier.forward(hidden_states)
+
+        // The input hidden_states is the pooled output from the encoder (e.g., CLS token).
+        // A dropout layer is applied here in the original implementation during training.
+        let pooled_output = self.pooler_dense.forward(hidden_states)?;
+
+        let pooled_output = match self.pooler_activation {
+            HiddenAct::Gelu => pooled_output.gelu(),
+            HiddenAct::Relu => pooled_output.relu(),
+            HiddenAct::Silu => pooled_output.silu(),
+            HiddenAct::Swiglu => {
+                candle::bail!("Swiglu activation is not supported for DeBERTa context pooler")
+            }
+        }?;
+
+        // Another dropout layer is applied here in the original implementation during training.
+        self.classifier.forward(&pooled_output)
     }
 }
 
