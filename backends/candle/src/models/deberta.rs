@@ -343,11 +343,23 @@ impl DeBertaDisentangledSelfAttention {
         } else {
             self.max_relative_positions
         };
-        if att_span <= 0 {
-            bail!("att_span must be a positive integer, but got {}", att_span);
-        }
 
-        let relative_pos = relative_pos.unsqueeze(0)?.repeat((total_bs_heads, 1, 1))?;
+        let relative_pos = match relative_pos.dims().len() {
+            2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
+            3 => relative_pos.unsqueeze(1)?,
+            4 => relative_pos.clone(),
+            other => bail!(
+                "Relative position ids must be of dim 2, 3, or 4. Got {}",
+                other
+            ),
+        };
+
+        let relative_pos = if relative_pos.dim(0)? == 1 {
+            relative_pos.repeat((total_bs_heads, 1, 1, 1))?.squeeze(1)?
+        } else {
+            relative_pos.reshape((total_bs_heads, q_len, k_len))?
+        };
+
         // The 'repeat' operation makes the tensor non-contiguous.
         // We ensure `pos_idx` is contiguous as it might be required by the gather kernel.
         let pos_idx = (relative_pos
@@ -403,18 +415,13 @@ impl DeBertaDisentangledSelfAttention {
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
 
-            let scaled_pos_query = (pos_query_layer / scale)?;
-            let p2c_att = scaled_pos_query.matmul(&key_layer.transpose(1, 2)?)?;
+            let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
+            let p2c_att = (p2c_att / scale)?;
 
-            let p2c_pos = pos_idx
-                .squeeze(0)?
-                .expand(&[total_bs_heads, q_len, k_len])?
-                .contiguous()?;
+            let p2c_att = p2c_att.gather(&pos_idx, 1)?;
 
-            let p2c_att = p2c_att.gather(&p2c_pos, 1)?;
             score = score.add(&p2c_att)?;
         }
-
         Ok(score)
     }
 }
