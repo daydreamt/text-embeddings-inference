@@ -596,12 +596,12 @@ impl DeBertaEncoder {
         };
         let norm_rel_ebd = config.norm_rel_ebd.as_deref().unwrap_or("none");
         let layer_norm = if norm_rel_ebd.contains("layer_norm") {
-            LayerNorm::load(
+            let ln = LayerNorm::load(
                 vb.pp("LayerNorm"),
                 config.hidden_size,
                 config.layer_norm_eps as f32,
-            )
-            .ok()
+            )?;
+            Some(ln)
         } else {
             None
         };
@@ -610,6 +610,7 @@ impl DeBertaEncoder {
         if max_relative_positions < 1 {
             max_relative_positions = config.max_position_embeddings as i64;
         }
+
         Ok(Self {
             layers,
             relative_attention_layer,
@@ -620,7 +621,6 @@ impl DeBertaEncoder {
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
-
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
         let mut current_hidden_states = hidden_states.clone();
