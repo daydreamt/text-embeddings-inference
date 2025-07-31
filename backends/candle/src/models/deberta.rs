@@ -364,6 +364,17 @@ impl DeBertaDisentangledSelfAttention {
             query_layer.device(),
         )?;
 
+        let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
+            pos_embedding
+                .reshape((2 * att_span as usize, n_head, d_head))?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((n_head, 2 * att_span as usize, d_head))?
+                .unsqueeze(0)?
+                .repeat((bs, 1, 1, 1))?
+                .reshape((total_bs_heads, 2 * att_span as usize, d_head))
+        };
+
         if self.pos_att_type.contains(&"c2p".to_string()) {
             let pos_key = if self.share_att_key {
                 self.key_proj.forward(&rel_embeddings)?
@@ -374,15 +385,7 @@ impl DeBertaDisentangledSelfAttention {
                 }
             };
 
-            // Reshape to [2*att_span, n_head, d_head] then transpose
-            let pos_key_layer = pos_key
-                .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)? // [n_head, 2*att_span, d_head]
-                .contiguous()?
-                .unsqueeze(0)? // [1, n_head, 2*att_span, d_head]
-                .repeat((bs, 1, 1, 1))? // [bs, n_head, 2*att_span, d_head]
-                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
-
+            let pos_key_layer = reshape_pos_embedding(pos_key)?;
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
             let c2p_att = c2p_att.contiguous()?.gather(&pos_idx, 2)?;
             score = score.add(&(c2p_att / scale)?)?;
@@ -398,25 +401,18 @@ impl DeBertaDisentangledSelfAttention {
                 }
             };
 
-            // Reshape to [2*att_span, n_head, d_head] then transpose
-            let pos_query_layer = pos_query
-                .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)? // [n_head, 2*att_span, d_head]
-                .contiguous()?
-                .unsqueeze(0)? // [1, n_head, 2*att_span, d_head]
-                .repeat((bs, 1, 1, 1))? // [bs, n_head, 2*att_span, d_head]
-                .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
+            let pos_query_layer = reshape_pos_embedding(pos_query)?;
 
-            let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
-            let p2c_att_transposed = p2c_att.transpose(1, 2)?;
-            // A transpose on a contiguous tensor results in a non-contiguous one.
-            // We ensure it's contiguous before passing to gather.
-            let pos_idx_transposed = pos_idx.transpose(1, 2)?.contiguous()?;
-            let gathered = p2c_att_transposed
-                .contiguous()?
-                .gather(&pos_idx_transposed, 2)?;
-            let p2c_att = gathered.transpose(1, 2)?;
-            score = score.add(&(p2c_att / scale)?)?;
+            let scaled_pos_query = (pos_query_layer / scale)?;
+            let p2c_att = scaled_pos_query.matmul(&key_layer.transpose(1, 2)?)?;
+
+            let p2c_pos = pos_idx
+                .squeeze(0)?
+                .expand(&[total_bs_heads, q_len, k_len])?
+                .contiguous()?;
+
+            let p2c_att = p2c_att.gather(&p2c_pos, 1)?;
+            score = score.add(&p2c_att)?;
         }
 
         Ok(score)
