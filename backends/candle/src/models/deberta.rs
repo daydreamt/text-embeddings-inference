@@ -411,7 +411,7 @@ impl DeBertaDisentangledSelfAttention {
                 .contiguous()?
                 .gather(&pos_idx_transposed, 2)?;
             let p2c_att = gathered.transpose(1, 2)?;
-            score = score.add(&(c2p_att / scale)?)?;
+            score = score.add(&(p2c_att / scale)?)?;
         }
 
         Ok(score)
