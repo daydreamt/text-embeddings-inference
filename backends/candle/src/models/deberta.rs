@@ -260,7 +260,7 @@ impl DeBertaDisentangledSelfAttention {
         }
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
 
-        let mut attention_scores = query_layer.matmul(&key_layer.t()?)?;
+        let mut attention_scores = (query_layer.matmul(&key_layer.t()?)? / scale)?;
 
         if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
             let rel_att = self.disentangled_attention_bias(
@@ -269,10 +269,8 @@ impl DeBertaDisentangledSelfAttention {
                 relative_pos,
                 rel_embeddings,
             )?;
-            attention_scores = attention_scores.add(&rel_att)?;
+            attention_scores = attention_scores.add(&(rel_att / scale)?)?;
         }
-
-        attention_scores = (attention_scores / scale)?;
 
         if let Some(attention_mask) = attention_mask {
             let (b, _, _, k) = attention_mask.dims4()?;
