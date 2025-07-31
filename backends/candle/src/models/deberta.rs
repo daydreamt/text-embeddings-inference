@@ -1,6 +1,6 @@
 use crate::layers::{HiddenAct, LayerNorm, Linear};
 use crate::models::Model;
-use candle::{bail, DType, Device, IndexOp, Module, Result, Tensor};
+use candle::{bail, DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Embedding, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -8,9 +8,9 @@ use text_embeddings_backend_core::{Batch, ModelType, Pool};
 
 // Helper function to build relative position ids, adapted from Hugging Face's candle implementation.
 fn build_relative_position(query_size: usize, key_size: usize, device: &Device) -> Result<Tensor> {
-    let q_ids = Tensor::arange(0, query_size as u32, device)?.to_dtype(DType::I64)?;
-    let k_ids = Tensor::arange(0, key_size as u32, device)?.to_dtype(DType::I64)?;
-    let rel_pos_ids = q_ids.unsqueeze(1)?.broadcast_sub(&k_ids.unsqueeze(0)?)?;
+    let q_ids = Tensor::arange(0, query_size as i64, device)?.unsqueeze(0)?;
+    let k_ids = Tensor::arange(0, key_size as i64, device)?.unsqueeze(D::Minus1)?;
+    let rel_pos_ids = k_ids.broadcast_sub(&q_ids)?;
     Ok(rel_pos_ids)
 }
 
