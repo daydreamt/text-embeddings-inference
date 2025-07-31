@@ -260,7 +260,8 @@ impl DeBertaDisentangledSelfAttention {
         }
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
 
-        let mut attention_scores = (query_layer.matmul(&key_layer.t()?)? / scale)?;
+        let scaled_key_layer = (key_layer.t()? / scale)?;
+        let mut attention_scores = query_layer.matmul(&scaled_key_layer)?;
 
         if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
             let rel_att = self.disentangled_attention_bias(
@@ -268,8 +269,9 @@ impl DeBertaDisentangledSelfAttention {
                 &key_layer,
                 relative_pos,
                 rel_embeddings,
+                scale,
             )?;
-            attention_scores = attention_scores.add(&(rel_att / scale)?)?;
+            attention_scores = attention_scores.add(&rel_att)?;
         }
 
         if let Some(attention_mask) = attention_mask {
@@ -324,6 +326,7 @@ impl DeBertaDisentangledSelfAttention {
         key_layer: &Tensor,
         relative_pos: &Tensor,
         rel_embeddings: &Tensor,
+        scale: f64,
     ) -> Result<Tensor> {
         let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
         let k_len = key_layer.dim(1)?;
@@ -377,7 +380,7 @@ impl DeBertaDisentangledSelfAttention {
 
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
             let c2p_att = c2p_att.contiguous()?.gather(&pos_idx, 2)?;
-            score = score.add(&c2p_att)?;
+            score = score.add(&(c2p_att / scale)?)?;
         }
 
         if self.pos_att_type.contains(&"p2c".to_string()) {
@@ -408,7 +411,7 @@ impl DeBertaDisentangledSelfAttention {
                 .contiguous()?
                 .gather(&pos_idx_transposed, 2)?;
             let p2c_att = gathered.transpose(1, 2)?;
-            score = score.add(&p2c_att)?;
+            score = score.add(&(c2p_att / scale)?)?;
         }
 
         Ok(score)
