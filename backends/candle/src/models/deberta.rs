@@ -668,9 +668,11 @@ pub struct DeBertaPooler {
 }
 
 impl DeBertaPooler {
-    pub fn load_embedding(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
-        let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
-
+    fn load_base(
+        vb: VarBuilder,
+        config: &DeBertaConfig,
+        pooler_hidden_size: usize,
+    ) -> Result<(Linear, HiddenAct)> {
         let dense = Linear::new(
             vb.pp("dense")
                 .get((pooler_hidden_size, config.hidden_size), "weight")?,
@@ -679,12 +681,17 @@ impl DeBertaPooler {
         );
 
         let activation = match &config.pooler_hidden_act {
-            Some(HiddenAct::Gelu) => HiddenAct::Gelu,
-            Some(HiddenAct::Relu) => HiddenAct::Relu,
-            Some(HiddenAct::Silu) => HiddenAct::Silu,
+            Some(act @ (HiddenAct::Gelu | HiddenAct::Relu | HiddenAct::Silu)) => act.clone(),
             Some(other) => bail!("Unsupported activation function: {:?}", other),
             None => bail!("pooler_hidden_act must be specified"),
         };
+
+        Ok((dense, activation))
+    }
+
+    pub fn load_embedding(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
+        let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
+        let (dense, activation) = Self::load_base(vb, config, pooler_hidden_size)?;
 
         Ok(Self {
             dense,
@@ -708,21 +715,7 @@ impl DeBertaPooler {
         })?;
 
         let pooler_vb = vb.pp("pooler");
-        let dense = Linear::new(
-            pooler_vb
-                .pp("dense")
-                .get((pooler_hidden_size, config.hidden_size), "weight")?,
-            Some(pooler_vb.pp("dense").get(pooler_hidden_size, "bias")?),
-            None,
-        );
-
-        let activation = match &config.pooler_hidden_act {
-            Some(HiddenAct::Gelu) => HiddenAct::Gelu,
-            Some(HiddenAct::Relu) => HiddenAct::Relu,
-            Some(HiddenAct::Silu) => HiddenAct::Silu,
-            Some(other) => bail!("Unsupported activation function: {:?}", other),
-            None => bail!("pooler_hidden_act must be specified"),
-        };
+        let (dense, activation) = Self::load_base(pooler_vb, config, pooler_hidden_size)?;
 
         let classifier = Linear::new(
             vb.pp("classifier")
@@ -743,14 +736,12 @@ impl DeBertaPooler {
         let _enter = self.span.enter();
 
         let first_token = hidden_states.i((.., 0))?;
-
         let pooled = self.dense.forward(&first_token)?;
 
         let activated = match self.activation {
             HiddenAct::Gelu => pooled.gelu(),
             HiddenAct::Relu => pooled.relu(),
             HiddenAct::Silu => pooled.silu(),
-            // This branch is now unreachable due to validation at load time
             _ => unreachable!("Invalid activation should have been caught during loading"),
         }?;
 
