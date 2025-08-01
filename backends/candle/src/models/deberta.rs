@@ -683,7 +683,7 @@ impl DeBertaPooler {
         let _enter = self.span.enter();
         let first_token = hidden_states.i((.., 0))?;
         let pooled = self.dense.forward(&first_token)?;
-        pooled.tanh()
+        pooled.tanh() // FIXME - 
     }
 }
 
