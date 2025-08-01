@@ -660,61 +660,69 @@ impl DeBertaEncoder {
     }
 }
 
-struct DeBertaPooler {
+pub struct DeBertaPooler {
     dense: Linear,
+    activation: HiddenAct,
+    classifier: Option<Linear>,
     span: tracing::Span,
 }
 
 impl DeBertaPooler {
-    pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
+    pub fn load_embedding(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
+        let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
+
         let dense = Linear::new(
             vb.pp("dense")
-                .get((config.hidden_size, config.hidden_size), "weight")?,
-            Some(vb.pp("dense").get(config.hidden_size, "bias")?),
+                .get((pooler_hidden_size, config.hidden_size), "weight")?,
+            Some(vb.pp("dense").get(pooler_hidden_size, "bias")?),
             None,
         );
+
+        let activation = match &config.pooler_hidden_act {
+            Some(HiddenAct::Gelu) => HiddenAct::Gelu,
+            Some(HiddenAct::Relu) => HiddenAct::Relu,
+            Some(HiddenAct::Silu) => HiddenAct::Silu,
+            Some(other) => bail!("Unsupported activation function: {:?}", other),
+            None => bail!("pooler_hidden_act must be specified"),
+        };
+
         Ok(Self {
             dense,
+            activation,
+            classifier: None,
             span: tracing::span!(tracing::Level::TRACE, "pooler"),
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let first_token = hidden_states.i((.., 0))?;
-        let pooled = self.dense.forward(&first_token)?;
-        pooled.tanh() // FIXME - 
-    }
-}
+    pub fn load_classification(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
+        let n_classes = config
+            .id2label
+            .as_ref()
+            .ok_or_else(|| {
+                candle::Error::Msg("`id2label` must be set for classifier models".to_string())
+            })?
+            .len();
 
-pub struct DeBertaClassificationHead {
-    pooler_dense: Linear,
-    pooler_activation: HiddenAct,
-    classifier: Linear,
-    span: tracing::Span,
-}
+        let pooler_hidden_size = config.pooler_hidden_size.ok_or_else(|| {
+            candle::Error::Msg("`pooler_hidden_size` must be set for classifier models".to_string())
+        })?;
 
-impl DeBertaClassificationHead {
-    pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
-        let n_classes = match &config.id2label {
-            None => bail!("`id2label` must be set for classifier models"),
-            Some(id2label) => id2label.len(),
-        };
-
-        let pooler_hidden_size = match config.pooler_hidden_size {
-            Some(size) if size > 0 => size,
-            _ => bail!("`pooler_hidden_size` must be set and greater than 0 for classifier models"),
-        };
-        // pooler dropout is 0 during inference in reference implementation
         let pooler_vb = vb.pp("pooler");
-        let pooler_dense = Linear::new(
+        let dense = Linear::new(
             pooler_vb
                 .pp("dense")
                 .get((pooler_hidden_size, config.hidden_size), "weight")?,
             Some(pooler_vb.pp("dense").get(pooler_hidden_size, "bias")?),
-            span: tracing::span!(tracing::Level::TRACE, "classifier.pooler"),
+            None,
         );
-        let pooler_activation = config.pooler_hidden_act.clone().unwrap_or(HiddenAct::Gelu);
+
+        let activation = match &config.pooler_hidden_act {
+            Some(HiddenAct::Gelu) => HiddenAct::Gelu,
+            Some(HiddenAct::Relu) => HiddenAct::Relu,
+            Some(HiddenAct::Silu) => HiddenAct::Silu,
+            Some(other) => bail!("Unsupported activation function: {:?}", other),
+            None => bail!("pooler_hidden_act must be specified"),
+        };
 
         let classifier = Linear::new(
             vb.pp("classifier")
@@ -722,32 +730,38 @@ impl DeBertaClassificationHead {
             Some(vb.pp("classifier").get(n_classes, "bias")?),
             None,
         );
+
         Ok(Self {
-            pooler_dense,
-            pooler_activation,
-            classifier,
-            span: tracing::span!(tracing::Level::TRACE, "classifier"),
+            dense,
+            activation,
+            classifier: Some(classifier),
+            span: tracing::span!(tracing::Level::TRACE, "pooler"),
         })
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
 
-        // The input hidden_states is the pooled output from the encoder (e.g., CLS token).
-        // A dropout layer is applied here in the original implementation during training.
-        let pooled_output = self.pooler_dense.forward(hidden_states)?;
+        let first_token = hidden_states.i((.., 0))?;
 
-        let pooled_output = match self.pooler_activation {
-            HiddenAct::Gelu => pooled_output.gelu(),
-            HiddenAct::Relu => pooled_output.relu(),
-            HiddenAct::Silu => pooled_output.silu(),
-            HiddenAct::Swiglu => {
-                candle::bail!("Swiglu activation is not supported for DeBERTa context pooler")
-            }
+        let pooled = self.dense.forward(&first_token)?;
+
+        let activated = match self.activation {
+            HiddenAct::Gelu => pooled.gelu(),
+            HiddenAct::Relu => pooled.relu(),
+            HiddenAct::Silu => pooled.silu(),
+            // This branch is now unreachable due to validation at load time
+            _ => unreachable!("Invalid activation should have been caught during loading"),
         }?;
 
-        // Another dropout layer is applied here in the original implementation during training.
-        self.classifier.forward(&pooled_output)
+        match &self.classifier {
+            Some(classifier) => classifier.forward(&activated),
+            None => Ok(activated),
+        }
+    }
+
+    pub fn is_classifier(&self) -> bool {
+        self.classifier.is_some()
     }
 }
 
@@ -756,7 +770,6 @@ pub struct DeBertaModel {
     encoder: DeBertaEncoder,
     pooler: Option<DeBertaPooler>,
     pool: Pool,
-    classifier: Option<DeBertaClassificationHead>,
     device: Device,
     dtype: DType,
     span: tracing::Span,
@@ -773,33 +786,30 @@ impl DeBertaModel {
             )
         }
 
-        let (pool, classifier) = match model_type {
+        let (pool, pooler) = match model_type {
             ModelType::Classifier => {
-                let classifier = DeBertaClassificationHead::load(vb.clone(), config)?;
-                (Pool::Cls, Some(classifier))
+                let pooler = DeBertaPooler::load_classification(vb.clone(), config)?;
+                (Pool::Cls, Some(pooler))
             }
             ModelType::Embedding(pool) => {
                 if pool == Pool::Splade {
                     candle::bail!("DeBERTa does not support Splade pooling");
                 }
-                (pool, None)
+                let pooler = DeBertaPooler::load_embedding(vb.pp("pooler"), config)
+                    .or_else(|_| DeBertaPooler::load_embedding(vb.pp("deberta.pooler"), config))
+                    .ok();
+                (pool, pooler)
             }
         };
+
         let embeddings = DeBertaEmbeddings::load(vb.pp("deberta.embeddings"), config)?;
         let encoder = DeBertaEncoder::load(vb.pp("deberta.encoder"), config)?;
-        let pooler = if classifier.is_none() {
-            DeBertaPooler::load(vb.pp("pooler"), config)
-                .or_else(|_| DeBertaPooler::load(vb.pp("deberta.pooler"), config))
-                .ok()
-        } else {
-            None
-        };
+
         Ok(Self {
             embeddings,
             encoder,
             pooler,
             pool,
-            classifier,
             device: vb.device().clone(),
             dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
@@ -810,39 +820,41 @@ impl DeBertaModel {
         let _enter = self.span.enter();
         let batch_len = batch.len();
         let max_length = batch.max_length as usize;
+
         let mut input_lengths = Vec::with_capacity(batch_len);
         for i in 0..batch_len {
             let length = batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i];
             input_lengths.push(length as f32);
         }
-        let (_, _, _, _, attention_bias, attention_mask) =
-            self.prepare_batch(&batch, &input_lengths)?;
+
+        let attention_bias = self.prepare_attention_bias(&batch, &input_lengths)?;
+
         let shape = (batch_len, max_length);
         let input_ids = Tensor::from_vec(batch.input_ids.clone(), shape, &self.device)?;
         let type_ids = Tensor::from_vec(batch.token_type_ids.clone(), shape, &self.device)?;
         let position_ids = Tensor::from_vec(batch.position_ids.clone(), shape, &self.device)?;
+
         let embedding_output = self
             .embeddings
             .forward(&input_ids, &type_ids, &position_ids)?;
         let encoder_output = self
             .encoder
             .forward(&embedding_output, attention_bias.as_ref())?;
+
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
-        let input_lengths_tensor =
-            Tensor::from_vec(input_lengths.clone(), (batch_len, 1), &self.device)?
-                .to_dtype(self.dtype)?;
+
         let pooled_embeddings = if has_pooling_requests {
             self.pool_embeddings(
                 encoder_output.clone(),
                 &batch,
-                attention_mask.as_ref(),
-                input_lengths_tensor,
+                &input_lengths,
                 has_raw_requests,
             )?
         } else {
             None
         };
+
         let raw_embeddings = if has_raw_requests {
             self.get_raw_embeddings(
                 encoder_output,
@@ -855,85 +867,46 @@ impl DeBertaModel {
         } else {
             None
         };
+
         Ok((pooled_embeddings, raw_embeddings))
     }
 
-    fn prepare_batch(
+    fn prepare_attention_bias(
         &self,
         batch: &Batch,
         input_lengths: &[f32],
-    ) -> Result<(
-        Vec<u32>,
-        Vec<u32>,
-        Vec<u32>,
-        Tensor,
-        Option<Tensor>,
-        Option<Tensor>,
-    )> {
+    ) -> Result<Option<Tensor>> {
         let batch_size = batch.len();
         let max_length = batch.max_length as usize;
-        if batch_size > 1 {
-            let mut attention_mask = Vec::with_capacity(batch_size * max_length);
-            let mut attention_bias = Vec::with_capacity(batch_size * max_length);
-            let mut masking = false;
-            for &length in input_lengths.iter() {
-                let seq_length = length as usize;
-                for _ in 0..seq_length {
-                    attention_mask.push(1.0_f32);
-                    attention_bias.push(0.0_f32);
-                }
-                let padding = max_length - seq_length;
-                if padding > 0 {
-                    masking = true;
-                    for _ in 0..padding {
-                        attention_mask.push(0.0_f32);
-                        attention_bias.push(f32::NEG_INFINITY);
-                    }
+
+        if batch_size <= 1 {
+            return Ok(None);
+        }
+
+        let mut attention_bias = Vec::with_capacity(batch_size * max_length);
+        let mut needs_masking = false;
+
+        for &length in input_lengths.iter() {
+            let seq_length = length as usize;
+            for _ in 0..seq_length {
+                attention_bias.push(0.0_f32);
+            }
+            let padding = max_length - seq_length;
+            if padding > 0 {
+                needs_masking = true;
+                for _ in 0..padding {
+                    attention_bias.push(f32::NEG_INFINITY);
                 }
             }
-            let input_lengths_tensor =
-                Tensor::from_vec(input_lengths.to_vec(), (batch_size, 1), &self.device)?
-                    .to_dtype(self.dtype)?;
-            let (attention_bias, attention_mask_tensor) = if masking {
-                let attention_mask_tensor = if self.pool == Pool::Mean {
-                    Some(
-                        Tensor::from_vec(
-                            attention_mask,
-                            (batch_size, max_length, 1),
-                            &self.device,
-                        )?
-                        .to_dtype(self.dtype)?,
-                    )
-                } else {
-                    None
-                };
-                let attention_bias_tensor =
-                    Tensor::from_vec(attention_bias, (batch_size, 1, 1, max_length), &self.device)?
-                        .to_dtype(self.dtype)?;
-                (Some(attention_bias_tensor), attention_mask_tensor)
-            } else {
-                (None, None)
-            };
-            Ok((
-                batch.input_ids.clone(),
-                batch.token_type_ids.clone(),
-                batch.position_ids.clone(),
-                input_lengths_tensor,
-                attention_bias,
-                attention_mask_tensor,
+        }
+
+        if needs_masking {
+            Ok(Some(
+                Tensor::from_vec(attention_bias, (batch_size, 1, 1, max_length), &self.device)?
+                    .to_dtype(self.dtype)?,
             ))
         } else {
-            let input_lengths_tensor =
-                Tensor::from_vec(input_lengths.to_vec(), (1, 1), &self.device)?
-                    .to_dtype(self.dtype)?;
-            Ok((
-                batch.input_ids.clone(),
-                batch.token_type_ids.clone(),
-                batch.position_ids.clone(),
-                input_lengths_tensor,
-                None,
-                None,
-            ))
+            Ok(None)
         }
     }
 
@@ -941,22 +914,20 @@ impl DeBertaModel {
         &self,
         mut outputs: Tensor,
         batch: &Batch,
-        attention_mask: Option<&Tensor>,
-        mut input_lengths: Tensor,
+        input_lengths: &[f32],
         has_raw_requests: bool,
     ) -> Result<Option<Tensor>> {
         let pooled_indices_length = batch.pooled_indices.len();
-        let pooled_indices = if has_raw_requests && pooled_indices_length > 0 {
+
+        if has_raw_requests && pooled_indices_length > 0 {
             let pooled_indices_tensor = Tensor::from_vec(
                 batch.pooled_indices.clone(),
                 pooled_indices_length,
                 &self.device,
             )?;
             outputs = outputs.index_select(&pooled_indices_tensor, 0)?;
-            Some(pooled_indices_tensor)
-        } else {
-            None
-        };
+        }
+
         let pooled_embeddings = match self.pool {
             Pool::Cls => {
                 if let Some(ref pooler) = self.pooler {
@@ -969,20 +940,24 @@ impl DeBertaModel {
                 bail!("LastToken pooling is not supported for DeBERTa")
             }
             Pool::Mean => {
-                let mut outputs_for_pooling = outputs;
-                if let Some(attention_mask) = attention_mask {
-                    let attention_mask = if let Some(pooled_indices) = pooled_indices {
-                        input_lengths = input_lengths.index_select(&pooled_indices, 0)?;
-                        attention_mask.index_select(&pooled_indices, 0)?
-                    } else {
-                        attention_mask.clone()
-                    };
-                    outputs_for_pooling = outputs_for_pooling.broadcast_mul(&attention_mask)?;
-                }
-                (outputs_for_pooling.sum(1)?.broadcast_div(&input_lengths))?
+                let input_lengths_tensor = if has_raw_requests && pooled_indices_length > 0 {
+                    let selected_lengths: Vec<f32> = batch
+                        .pooled_indices
+                        .iter()
+                        .map(|&idx| input_lengths[idx as usize])
+                        .collect();
+                    Tensor::from_vec(selected_lengths, (pooled_indices_length, 1), &self.device)?
+                        .to_dtype(self.dtype)?
+                } else {
+                    Tensor::from_vec(input_lengths.to_vec(), (batch.len(), 1), &self.device)?
+                        .to_dtype(self.dtype)?
+                };
+
+                outputs.sum(1)?.broadcast_div(&input_lengths_tensor)?
             }
             Pool::Splade => unreachable!(),
         };
+
         Ok(Some(pooled_embeddings))
     }
 
@@ -997,6 +972,7 @@ impl DeBertaModel {
     ) -> Result<Option<Tensor>> {
         let (_b, _l, h) = outputs.shape().dims3()?;
         let outputs = outputs.reshape((batch_size * max_length, h))?;
+
         if batch_size > 1 && has_pooling_requests {
             let mut final_indices: Vec<u32> = Vec::with_capacity(batch_size * max_length);
             for &i_u32 in batch.raw_indices.iter() {
@@ -1027,15 +1003,18 @@ impl Model for DeBertaModel {
     }
 
     fn predict(&self, batch: Batch) -> Result<Tensor> {
-        match &self.classifier {
-            None => candle::bail!("`predict` is not implemented for embedding models"),
-            Some(classifier) => {
-                let (pooled_embeddings, _raw_embeddings) = self.forward(batch)?;
-                let pooled_embeddings =
-                    pooled_embeddings.expect("pooled_embeddings is empty. This is a bug.");
-                classifier.forward(&pooled_embeddings)
-            }
+        let pooler = self
+            .pooler
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("No pooler available for prediction".to_string()))?;
+
+        if !pooler.is_classifier() {
+            candle::bail!("`predict` requires a classification pooler");
         }
+
+        let (pooled_embeddings, _) = self.forward(batch)?;
+        pooled_embeddings
+            .ok_or_else(|| candle::Error::Msg("No pooled embeddings available".to_string()))
     }
 }
 
