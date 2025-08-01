@@ -6,14 +6,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use text_embeddings_backend_core::{Batch, ModelType, Pool};
 
-// Helper function to build relative position ids, adapted from Hugging Face's candle implementation.
-fn build_relative_position(query_size: usize, key_size: usize, device: &Device) -> Result<Tensor> {
-    let q_ids = Tensor::arange(0, query_size as i64, device)?.unsqueeze(0)?;
-    let k_ids = Tensor::arange(0, key_size as i64, device)?.unsqueeze(D::Minus1)?;
-    let rel_pos_ids = k_ids.broadcast_sub(&q_ids)?;
-    Ok(rel_pos_ids)
-}
-
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DeBertaConfig {
     pub vocab_size: usize,
@@ -636,16 +628,13 @@ impl DeBertaEncoder {
         let (q_len, k_len) = (hidden_states.dim(1)?, hidden_states.dim(1)?);
 
         let relative_pos = if self.relative_attention {
-            let mut rel_pos = build_relative_position(q_len, k_len, hidden_states.device())?;
-            if self.position_buckets > 0 && self.max_relative_positions > 0 {
-                rel_pos = make_log_bucket_position(
-                    rel_pos,
-                    self.position_buckets.try_into().unwrap(),
-                    self.max_relative_positions.try_into().unwrap(),
-                    hidden_states.device(),
-                )?
-                .to_dtype(DType::I64)?;
-            }
+            let mut rel_pos = build_relative_position(
+                q_len,
+                k_len,
+                hidden_states.device(),
+                Some(self.position_buckets as isize),
+                Some(self.max_relative_positions as isize),
+            )?;
             Some(rel_pos)
         } else {
             None
@@ -1048,6 +1037,30 @@ impl Model for DeBertaModel {
         }
     }
 }
+
+// https://github.com/huggingface/candle/blob/26a3222d557caefab41b9c3e63a08213c32e5472/candle-transformers/src/models/debertav2.rs#L1368
+pub(crate) fn build_relative_position(
+    query_size: usize,
+    key_size: usize,
+    device: &Device,
+    bucket_size: Option<isize>,
+    max_position: Option<isize>,
+) -> Result<Tensor> {
+    let q_ids = Tensor::arange(0, query_size as i64, device)?.unsqueeze(0)?;
+    let k_ids: Tensor = Tensor::arange(0, key_size as i64, device)?.unsqueeze(D::Minus1)?;
+    let mut rel_pos_ids = k_ids.broadcast_sub(&q_ids)?;
+    let bucket_size = bucket_size.unwrap_or(-1);
+    let max_position = max_position.unwrap_or(-1);
+
+    if bucket_size > 0 && max_position > 0 {
+        rel_pos_ids = make_log_bucket_position(rel_pos_ids, bucket_size, max_position, device)?;
+    }
+
+    rel_pos_ids = rel_pos_ids.to_dtype(DType::I64)?;
+    rel_pos_ids = rel_pos_ids.narrow(0, 0, query_size)?;
+    rel_pos_ids.unsqueeze(0)
+}
+
 // https://github.com/huggingface/candle/blob/42bd33e0a6c114838e623e5e11fb466628888bbf/candle-transformers/src/models/debertav2.rs#L1390
 pub(crate) fn make_log_bucket_position(
     relative_pos: Tensor,
