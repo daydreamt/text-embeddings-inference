@@ -26,7 +26,6 @@ pub struct DeBertaConfig {
     pub classifier_dropout: Option<f64>,
     pub id2label: Option<HashMap<String, String>>,
     pub label2id: Option<HashMap<String, u32>>,
-
     // DeBERTa specific configurations
     pub relative_attention: bool,
     pub pos_att_type: Option<Vec<String>>,
@@ -130,20 +129,16 @@ struct DeBertaDisentangledSelfAttention {
     query_proj: Linear,
     key_proj: Linear,
     value_proj: Linear,
-
     pos_att_type: Vec<String>,
     max_relative_positions: i64,
     position_buckets: i64,
     share_att_key: bool,
     pos_key_proj: Option<Linear>,
     pos_query_proj: Option<Linear>,
-
     num_attention_heads: usize,
     attention_head_size: usize,
     all_head_size: usize,
-
     pos_dropout: f64,
-
     span: tracing::Span,
 }
 
@@ -235,19 +230,24 @@ impl DeBertaDisentangledSelfAttention {
         let _enter = self.span.enter();
         let (batch_size, seq_len, _) = hidden_states.dims3()?;
 
-        let query_layer = self.query_proj.forward(hidden_states)?;
-        let key_layer = self.key_proj.forward(hidden_states)?;
-        let value_layer = self.value_proj.forward(hidden_states)?;
-
-        let query_layer = self.transpose_for_scores(&query_layer, batch_size, seq_len)?;
-        let key_layer = self.transpose_for_scores(&key_layer, batch_size, seq_len)?;
-        let value_layer = self.transpose_for_scores(&value_layer, batch_size, seq_len)?;
+        let query_layer = self.transpose_for_scores(
+            self.query_proj.forward(hidden_states)?,
+            batch_size,
+            seq_len,
+        )?;
+        let key_layer =
+            self.transpose_for_scores(self.key_proj.forward(hidden_states)?, batch_size, seq_len)?;
+        let value_layer = self.transpose_for_scores(
+            self.value_proj.forward(hidden_states)?,
+            batch_size,
+            seq_len,
+        )?;
 
         let mut scale_factor = 1.0;
-        if self.pos_att_type.contains(&"c2p".to_string()) {
+        if self.pos_att_type.iter().any(|s| s == "c2p") {
             scale_factor += 1.0;
         }
-        if self.pos_att_type.contains(&"p2c".to_string()) {
+        if self.pos_att_type.iter().any(|s| s == "p2c") {
             scale_factor += 1.0;
         }
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
@@ -296,12 +296,7 @@ impl DeBertaDisentangledSelfAttention {
             .reshape((batch_size, seq_len, self.all_head_size))
     }
 
-    fn transpose_for_scores(
-        &self,
-        x: &Tensor,
-        batch_size: usize,
-        seq_len: usize,
-    ) -> Result<Tensor> {
+    fn transpose_for_scores(&self, x: Tensor, batch_size: usize, seq_len: usize) -> Result<Tensor> {
         x.reshape((
             batch_size,
             seq_len,
@@ -379,7 +374,7 @@ impl DeBertaDisentangledSelfAttention {
                 .reshape((total_bs_heads, 2 * att_span as usize, d_head))
         };
 
-        if self.pos_att_type.contains(&"c2p".to_string()) {
+        if self.pos_att_type.iter().any(|s| s == "c2p") {
             let pos_key = if self.share_att_key {
                 self.key_proj.forward(&rel_embeddings)?
             } else {
@@ -395,7 +390,7 @@ impl DeBertaDisentangledSelfAttention {
             score = score.add(&(c2p_att / scale)?)?;
         }
 
-        if self.pos_att_type.contains(&"p2c".to_string()) {
+        if self.pos_att_type.iter().any(|s| s == "p2c") {
             let pos_query = if self.share_att_key {
                 self.query_proj.forward(&rel_embeddings)?
             } else {
