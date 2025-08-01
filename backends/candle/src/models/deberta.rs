@@ -712,7 +712,7 @@ impl DeBertaClassificationHead {
                 .pp("dense")
                 .get((pooler_hidden_size, config.hidden_size), "weight")?,
             Some(pooler_vb.pp("dense").get(pooler_hidden_size, "bias")?),
-            None,
+            span: tracing::span!(tracing::Level::TRACE, "classifier.pooler"),
         );
         let pooler_activation = config.pooler_hidden_act.clone().unwrap_or(HiddenAct::Gelu);
 
