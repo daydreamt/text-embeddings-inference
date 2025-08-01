@@ -547,7 +547,7 @@ impl DeBertaRelativeEmbeddings {
             max_relative_positions = config.max_position_embeddings as i64;
         }
         let position_buckets = config.position_buckets.unwrap_or(-1);
-        // Buckets take precedence over max_relative_positions.
+        // Buckets take precedence over max_position_embeddings.
         let pos_ebd_size = if position_buckets > 0 {
             position_buckets
         } else {
@@ -701,9 +701,12 @@ impl DeBertaClassificationHead {
             Some(id2label) => id2label.len(),
         };
 
+        let pooler_hidden_size = match config.pooler_hidden_size {
+            Some(size) if size > 0 => size,
+            _ => bail!("`pooler_hidden_size` must be set and greater than 0 for classifier models"),
+        };
+        // pooler dropout is 0 during inference in reference implementation
         let pooler_vb = vb.pp("pooler");
-        // In DeBERTa v2, pooler_hidden_size is typically the same as hidden_size.
-        let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
         let pooler_dense = Linear::new(
             pooler_vb
                 .pp("dense")
