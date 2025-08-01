@@ -547,15 +547,18 @@ impl DeBertaRelativeEmbeddings {
             max_relative_positions = config.max_position_embeddings as i64;
         }
         let position_buckets = config.position_buckets.unwrap_or(-1);
+        // Buckets take precedence over max_relative_positions.
         let pos_ebd_size = if position_buckets > 0 {
-            position_buckets * 2
+            position_buckets
         } else {
-            max_relative_positions * 2
+            max_relative_positions
         };
+        // The embedding table is 2x the size (for negative and positive positions)
         let embeddings = Embedding::new(
-            vb.get((pos_ebd_size as usize, config.hidden_size), "weight")?,
+            vb.get((pos_ebd_size as usize * 2, config.hidden_size), "weight")?,
             config.hidden_size,
         );
+
         Ok(Self {
             embeddings,
             span: tracing::span!(tracing::Level::TRACE, "relative_embeddings"),
@@ -623,7 +626,7 @@ impl DeBertaEncoder {
         let (q_len, k_len) = (hidden_states.dim(1)?, hidden_states.dim(1)?);
 
         let relative_pos = if self.relative_attention {
-            let mut rel_pos = build_relative_position(
+            let rel_pos = build_relative_position(
                 q_len,
                 k_len,
                 hidden_states.device(),
