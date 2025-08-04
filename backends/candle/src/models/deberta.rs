@@ -85,7 +85,9 @@ impl DeBertaEmbeddings {
                 .get((config.type_vocab_size, config.hidden_size), "weight")
             {
                 Ok(w) => Some(Embedding::new(w, config.hidden_size)),
-                Err(_) => None,
+                Err(_) => candle::bail!(
+                    "configuration type_vocab_size > 0 but no token_type_embeddings in the model"
+                ),
             }
         } else {
             None
