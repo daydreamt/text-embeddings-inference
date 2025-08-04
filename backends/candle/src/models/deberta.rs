@@ -349,14 +349,6 @@ impl DeBertaDisentangledSelfAttention {
             relative_pos.reshape((total_bs_heads, q_len, k_len))?
         };
 
-        // The 'repeat' operation makes the tensor non-contiguous.
-        // We ensure `pos_idx` is contiguous as it might be required by the gather kernel.
-        let pos_idx = (relative_pos
-            .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?)
-        .clamp(0i64, 2 * att_span - 1)?
-        .to_dtype(DType::U32)?
-        .contiguous()?;
-
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
         let mut score = Tensor::zeros(
@@ -386,9 +378,15 @@ impl DeBertaDisentangledSelfAttention {
                 }
             };
 
+            let c2p_pos_idx = (relative_pos
+                .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?)
+            .clamp(0i64, 2 * att_span - 1)?
+            .to_dtype(DType::U32)?
+            .contiguous()?;
+
             let pos_key_layer = reshape_pos_embedding(pos_key)?;
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
-            let c2p_att = c2p_att.contiguous()?.gather(&pos_idx, 2)?;
+            let c2p_att = c2p_att.contiguous()?.gather(&c2p_pos_idx, 2)?;
             score = score.add(&(c2p_att / scale)?)?;
         }
 
@@ -402,12 +400,32 @@ impl DeBertaDisentangledSelfAttention {
                 }
             };
 
+            let r_pos = if key_layer.dim(1)? != query_layer.dim(1)? {
+                build_relative_position(
+                    key_layer.dim(1)?,
+                    key_layer.dim(1)?,
+                    relative_pos.device(),
+                    Some(self.position_buckets as isize),
+                    Some(self.max_relative_positions as isize),
+                )?
+            } else {
+                relative_pos.clone()
+            };
+
+            // ENH: .neg() currently not implemented for metal backend for I64
+            let p2c_pos_idx = Tensor::new(att_span, relative_pos.device())?
+            .broadcast_sub(&r_pos)?
+            .clamp(0i64, 2 * att_span - 1)?
+            .to_dtype(DType::U32)?
+            .contiguous()?;
+
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
 
-            let p2c_att = pos_query_layer.matmul(&key_layer.transpose(1, 2)?)?;
+            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
             let p2c_att = (p2c_att / scale)?;
-
-            let p2c_att = p2c_att.gather(&pos_idx, 1)?;
+            let p2c_att = p2c_att.gather(&p2c_pos_idx, 2)?.transpose(1, 2)?;
+            let p2c_sum = p2c_att.sum_all()?;
+            println!("  p2c_att sum: {}", p2c_sum);
 
             score = score.add(&p2c_att)?;
         }
