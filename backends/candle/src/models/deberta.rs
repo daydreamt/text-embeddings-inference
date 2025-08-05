@@ -377,6 +377,9 @@ impl DeBertaDisentangledSelfAttention {
                     None => return Err(candle::Error::Msg("pos_key_proj not found".to_string())),
                 }
             };
+            println!("TEI c2p - share_att_key: {}", self.share_att_key);
+            println!("TEI c2p - pos_key shape: {:?}", pos_key.shape());
+
 
             let c2p_pos_idx = (relative_pos
                 .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?)
@@ -384,9 +387,15 @@ impl DeBertaDisentangledSelfAttention {
             .to_dtype(DType::U32)?
             .contiguous()?;
 
+            //println!("TEI c2p - c2p_pos_idx first 10 values: {:?}",
+            //c2p_pos_idx.flatten_all()?.to_vec1::<u32>()?.iter().take(10).collect::<Vec<_>>());
+
+
             let pos_key_layer = reshape_pos_embedding(pos_key)?;
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
             let c2p_att = c2p_att.contiguous()?.gather(&c2p_pos_idx, 2)?;
+            println!("TEI c2p - c2p_att shape before gather: {:?}", c2p_att.shape());
+
             score = score.add(&(c2p_att / scale)?)?;
         }
 
@@ -412,6 +421,9 @@ impl DeBertaDisentangledSelfAttention {
                 relative_pos.clone()
             };
 
+            println!("TEI p2c - r_pos differs from relative_pos: {}",
+            if key_layer.dim(1)? != query_layer.dim(1)? { "yes" } else { "no" });
+
             // ENH: .neg() currently not implemented for metal backend for I64
             let p2c_pos_idx = Tensor::new(att_span, relative_pos.device())?
             .broadcast_sub(&r_pos)?
@@ -419,16 +431,25 @@ impl DeBertaDisentangledSelfAttention {
             .to_dtype(DType::U32)?
             .contiguous()?;
 
+            //println!("TEI p2c - p2c_pos_idx first 10 values: {:?}",
+            //    p2c_pos_idx.flatten_all()?.to_vec1::<u32>()?.iter().take(10).collect::<Vec<_>>());
+
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
+            println!("TEI p2c - pos_query_layer shape: {:?}", pos_query_layer.shape());
 
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
             let p2c_att = (p2c_att / scale)?;
             let p2c_att = p2c_att.gather(&p2c_pos_idx, 2)?.transpose(1, 2)?;
+
+            println!("TEI p2c - p2c_att shape before gather: {:?}", p2c_att.shape());
+            println!("TEI p2c - p2c_att sum before scale: {}", p2c_att.sum_all()?);
+
             let p2c_sum = p2c_att.sum_all()?;
             println!("  p2c_att sum: {}", p2c_sum);
 
             score = score.add(&p2c_att)?;
         }
+        println!("TEI - final score sum: {}", score.sum_all()?);
         Ok(score)
     }
 }
@@ -640,34 +661,41 @@ impl DeBertaEncoder {
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
-    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let mut current_hidden_states = hidden_states.clone();
+
+    fn get_rel_pos(&self, hidden_states: &Tensor) -> Result<Option<Tensor>> {
+        if !self.relative_attention {
+            return Ok(None);
+        }
         let (q_len, k_len) = (hidden_states.dim(1)?, hidden_states.dim(1)?);
+        let rel_pos = build_relative_position(
+            q_len,
+            k_len,
+            hidden_states.device(),
+            Some(self.position_buckets as isize),
+            Some(self.max_relative_positions as isize),
+        )?;
+        Ok(Some(rel_pos))
+    }
 
-        let relative_pos = if self.relative_attention {
-            let rel_pos = build_relative_position(
-                q_len,
-                k_len,
-                hidden_states.device(),
-                Some(self.position_buckets as isize),
-                Some(self.max_relative_positions as isize),
-            )?;
-            Some(rel_pos)
-        } else {
-            None
-        };
-
-        let relative_embeddings = if let Some(rel_attn_layer) = &self.relative_attention_layer {
+    fn get_rel_embedding(&self) -> Result<Option<Tensor>> {
+        if let Some(rel_attn_layer) = &self.relative_attention_layer {
             let mut embeddings = rel_attn_layer.get_rel_embedding()?;
             if let Some(ln) = &self.layer_norm {
                 embeddings = ln.forward(&embeddings, None)?;
             }
-            Some(embeddings)
+            Ok(Some(embeddings))
         } else {
-            None
-        };
+            Ok(None)
+        }
+    }
 
+    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        let relative_pos = self.get_rel_pos(hidden_states)?;
+        let relative_embeddings = self.get_rel_embedding()?;
+
+        let mut current_hidden_states = hidden_states.clone();
         for layer in &self.layers {
             current_hidden_states = layer.forward(
                 &current_hidden_states,
