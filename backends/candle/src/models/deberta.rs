@@ -114,6 +114,7 @@ impl DeBertaEmbeddings {
         input_ids: &Tensor,
         token_type_ids: &Tensor,
         position_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let mut embeddings = self.word_embeddings.forward(input_ids)?;
@@ -123,7 +124,14 @@ impl DeBertaEmbeddings {
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
-        self.layer_norm.forward(&embeddings, None)
+        let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
+
+        if let Some(mask) = attention_mask {
+            let mask = mask.unsqueeze(D::Minus1)?.expand(embeddings.shape())?;
+            embeddings = embeddings.broadcast_mul(&mask.to_dtype(embeddings.dtype())?)?;
+        }
+
+        Ok(embeddings)
     }
 }
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L72
@@ -881,7 +889,7 @@ impl DeBertaModel {
         }
         let attention_mask_2d =
             Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?;
-        let attention_mask_4d = self._get_attention_mask(attention_mask_2d)?;
+        let attention_mask_4d = self._get_attention_mask(attention_mask_2d.clone())?;
 
         // The pooling logic downstream requires f32 lengths.
         let input_lengths_f32: Vec<f32> = input_lengths.iter().map(|&l| l as f32).collect();
@@ -891,9 +899,12 @@ impl DeBertaModel {
         let type_ids = Tensor::from_vec(batch.token_type_ids.clone(), shape, &self.device)?;
         let position_ids = Tensor::from_vec(batch.position_ids.clone(), shape, &self.device)?;
 
-        let embedding_output = self
-            .embeddings
-            .forward(&input_ids, &type_ids, &position_ids)?;
+        let embedding_output = self.embeddings.forward(
+            &input_ids,
+            &type_ids,
+            &position_ids,
+            Some(&attention_mask_2d),
+        )?;
 
         let encoder_output = self
             .encoder
