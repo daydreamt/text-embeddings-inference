@@ -99,12 +99,11 @@ impl DeBertaEmbeddings {
             None
         };
 
-        // Conditionally load the projection layer
         let embed_proj = if embedding_size != hidden_size {
             let proj = Linear::new(
                 vb.pp("embed_proj")
-                    .get((hidden_size, embedding_size), "weight")?,
-                None, // embed_proj has no bias
+                    .get((embedding_size, hidden_size), "weight")?, // (embedding_size, hidden_size)
+                None,
                 None,
             );
             Some(proj)
@@ -140,16 +139,17 @@ impl DeBertaEmbeddings {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let mut embeddings = self.word_embeddings.forward(input_ids)?;
+
         if let Some(ref position_embeddings) = self.position_embeddings {
             embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
         }
 
-        if let Some(ref token_type_embeddings) = self.token_type_embeddings {
-            embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
-        }
-
         if let Some(proj) = &self.embed_proj {
             embeddings = proj.forward(&embeddings)?;
+        }
+
+        if let Some(ref token_type_embeddings) = self.token_type_embeddings {
+            embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
 
         let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
@@ -320,7 +320,8 @@ impl DeBertaDisentangledSelfAttention {
         }
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
 
-        let scale_tensor = Tensor::new(scale as f32, &self.device)?.to_dtype(key_layer.dtype())?;
+        let scale_tensor =
+            Tensor::new(&[scale as f32], &self.device)?.to_dtype(key_layer.dtype())?;
         let mut attention_scores =
             query_layer.matmul(&key_layer.t()?.broadcast_div(&scale_tensor)?)?;
 
