@@ -126,6 +126,31 @@ impl DeBertaEmbeddings {
         self.layer_norm.forward(&embeddings, None)
     }
 }
+// https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L72
+struct XSoftmax {}
+
+impl XSoftmax {
+    fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
+        // Invert the mask: 1.0 for valid tokens, 0.0 for padding becomes 0 for valid, 1 for padding.
+        let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
+        rmask = rmask
+            .broadcast_lt(&Tensor::new(&[1.0_f32], device)?)?
+            .to_dtype(DType::U8)?;
+
+        let min_value_tensor = Tensor::new(f32::MIN, device)?
+            .to_dtype(input.dtype())?
+            .broadcast_as(input.shape())?;
+        let mut output = rmask.where_cond(&min_value_tensor, input)?;
+
+        output = candle_nn::ops::softmax(&output, dim)?;
+
+        // Zero out the probabilities for padded tokens.
+        let t_zeroes = Tensor::zeros_like(&output)?;
+        output = rmask.where_cond(&t_zeroes, &output)?;
+
+        Ok(output)
+    }
+}
 
 struct DeBertaDisentangledSelfAttention {
     query_proj: Linear,
@@ -142,6 +167,8 @@ struct DeBertaDisentangledSelfAttention {
     all_head_size: usize,
     pos_dropout: f64,
     span: tracing::Span,
+    // ADDED: Device for XSoftmax
+    device: Device,
 }
 
 impl DeBertaDisentangledSelfAttention {
@@ -219,13 +246,14 @@ impl DeBertaDisentangledSelfAttention {
             all_head_size,
             pos_dropout: config.hidden_dropout_prob,
             span: tracing::span!(tracing::Level::TRACE, "disentangled_self_attention"),
+            device: vb.device().clone(),
         })
     }
 
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &Tensor,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
@@ -254,8 +282,9 @@ impl DeBertaDisentangledSelfAttention {
         }
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
 
-        let mut attention_scores = query_layer.matmul(&key_layer.t()?)?;
-        attention_scores = (attention_scores / scale)?;
+        let scale_tensor = Tensor::new(scale as f32, &self.device)?.to_dtype(key_layer.dtype())?;
+        let mut attention_scores =
+            query_layer.matmul(&key_layer.t()?.broadcast_div(&scale_tensor)?)?;
 
         if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
             let rel_att = self.disentangled_attention_bias(
@@ -268,47 +297,15 @@ impl DeBertaDisentangledSelfAttention {
             attention_scores = attention_scores.add(&rel_att)?;
         }
 
-        if let Some(attention_mask) = attention_mask {
-            // Reshape attention mask similar to Candle
-            let attention_mask = match attention_mask.dims().len() {
-                2 => {
-                    let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
-                    extended_attention_mask.broadcast_mul(
-                        &extended_attention_mask
-                            .squeeze(D::Minus2)?
-                            .unsqueeze(D::Minus1)?,
-                    )?
-                }
-                3 => attention_mask.unsqueeze(1)?,
-                4 => attention_mask.clone(),
-                _ => bail!("Unsupported attention mask dimensions"),
-            };
-            
-            attention_scores = attention_scores.reshape((
-                batch_size,
-                self.num_attention_heads,
-                seq_len,
-                seq_len,
-            ))?;
-            
-            let mut rmask = attention_mask.broadcast_as(attention_scores.shape())?.to_dtype(DType::F32)?;
-            rmask = rmask
-                .broadcast_lt(&Tensor::new(&[1.0_f32], attention_scores.device())?)?
-                .to_dtype(DType::U8)?;
-            
-            let min_value_tensor = Tensor::new(&[f32::MIN], attention_scores.device())?.broadcast_as(attention_scores.shape())?;
-            attention_scores = rmask.where_cond(&min_value_tensor, &attention_scores)?;
-        }
+        let attention_scores =
+            attention_scores.reshape((batch_size, self.num_attention_heads, seq_len, seq_len))?;
 
-        let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
-        
-        // Reshape back for matmul
-        let attention_probs = attention_probs.reshape((
-            batch_size * self.num_attention_heads,
-            seq_len,
-            seq_len,
-        ))?;
-        
+        let attention_probs =
+            XSoftmax::apply(&attention_scores, attention_mask, D::Minus1, &self.device)?;
+
+        let attention_probs =
+            attention_probs.reshape((batch_size * self.num_attention_heads, seq_len, seq_len))?;
+
         let context_layer = attention_probs.matmul(&value_layer)?;
 
         context_layer
@@ -358,7 +355,6 @@ impl DeBertaDisentangledSelfAttention {
             self.max_relative_positions
         };
 
-        // Handle relative_pos dimensions like Candle
         let relative_pos = match relative_pos.dims().len() {
             2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
             3 => relative_pos.unsqueeze(1)?,
@@ -383,7 +379,6 @@ impl DeBertaDisentangledSelfAttention {
             query_layer.device(),
         )?;
 
-        // Port from Candle: Updated reshape function
         let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
             pos_embedding
                 .reshape((2 * att_span as usize, n_head, d_head))?
@@ -406,23 +401,22 @@ impl DeBertaDisentangledSelfAttention {
             };
 
             let pos_key_layer = reshape_pos_embedding(pos_key)?;
-            
-            // Port from Candle: Different scale calculation
+
             let scale_tensor = Tensor::new(
                 &[(pos_key_layer.dim(D::Minus1)? as f64 * scale) as f32],
                 query_layer.device(),
             )?
             .sqrt()?
             .to_dtype(query_layer.dtype())?;
-            
+
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
-            
+
             let c2p_pos = relative_pos
                 .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?
                 .clamp(0i64, 2 * att_span - 1)?
                 .to_dtype(DType::U32)?
                 .contiguous()?;
-            
+
             let c2p_att = c2p_att.gather(&c2p_pos, 2)?;
             score = score.add(&c2p_att.broadcast_div(&scale_tensor)?)?;
         }
@@ -449,7 +443,6 @@ impl DeBertaDisentangledSelfAttention {
                 relative_pos.clone()
             };
 
-            // Port from Candle: Use neg() and proper clamping
             let p2c_pos = r_pos
                 .to_dtype(DType::F32)?
                 .neg()?
@@ -459,21 +452,20 @@ impl DeBertaDisentangledSelfAttention {
                 .contiguous()?;
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
-            
-            // Port from Candle: Different scale calculation
+
             let scale_tensor = Tensor::new(
                 &[(pos_query_layer.dim(D::Minus1)? as f64 * scale) as f32],
                 key_layer.device(),
             )?
             .sqrt()?
             .to_dtype(query_layer.dtype())?;
-            
+
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
             let p2c_att = p2c_att.gather(&p2c_pos, 2)?.transpose(1, 2)?;
-            
+
             score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
         }
-        
+
         Ok(score)
     }
 }
@@ -515,7 +507,7 @@ impl DeBertaAttention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &Tensor,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
@@ -579,10 +571,11 @@ impl DeBertaLayer {
         })
     }
 
+    // MODIFIED: Function signature updated.
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &Tensor,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
@@ -713,7 +706,7 @@ impl DeBertaEncoder {
         }
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
 
         let relative_pos = self.get_rel_pos(hidden_states)?;
@@ -884,13 +877,29 @@ impl DeBertaModel {
         let batch_len = batch.len();
         let max_length = batch.max_length as usize;
 
+        // First, calculate the length of each sequence in the batch
         let mut input_lengths = Vec::with_capacity(batch_len);
         for i in 0..batch_len {
-            let length = batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i];
-            input_lengths.push(length as f32);
+            let length =
+                (batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i]) as usize;
+            input_lengths.push(length);
         }
 
-        let attention_bias = self.prepare_attention_bias(&batch, &input_lengths)?;
+        // MODIFIED: Create a standard 2D attention mask from the sequence lengths.
+        // The `Batch` struct does not have an `attention_mask` field; we must build it.
+        let mut attention_mask_vec = Vec::with_capacity(batch_len * max_length);
+        for &seq_len in &input_lengths {
+            // 1 for valid tokens
+            attention_mask_vec.extend(std::iter::repeat(1u8).take(seq_len));
+            // 0 for padding
+            attention_mask_vec.extend(std::iter::repeat(0u8).take(max_length - seq_len));
+        }
+        let attention_mask_2d =
+            Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?;
+        let attention_mask_4d = self._get_attention_mask(attention_mask_2d)?;
+
+        // The pooling logic downstream requires f32 lengths.
+        let input_lengths_f32: Vec<f32> = input_lengths.iter().map(|&l| l as f32).collect();
 
         let shape = (batch_len, max_length);
         let input_ids = Tensor::from_vec(batch.input_ids.clone(), shape, &self.device)?;
@@ -900,9 +909,10 @@ impl DeBertaModel {
         let embedding_output = self
             .embeddings
             .forward(&input_ids, &type_ids, &position_ids)?;
+
         let encoder_output = self
             .encoder
-            .forward(&embedding_output, attention_bias.as_ref())?;
+            .forward(&embedding_output, &attention_mask_4d)?;
 
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
@@ -911,7 +921,7 @@ impl DeBertaModel {
             self.pool_embeddings(
                 encoder_output.clone(),
                 &batch,
-                &input_lengths,
+                &input_lengths_f32,
                 has_raw_requests,
             )?
         } else {
@@ -922,7 +932,7 @@ impl DeBertaModel {
             self.get_raw_embeddings(
                 encoder_output,
                 &batch,
-                &input_lengths,
+                &input_lengths_f32,
                 batch_len,
                 max_length,
                 has_pooling_requests,
@@ -934,43 +944,21 @@ impl DeBertaModel {
         Ok((pooled_embeddings, raw_embeddings))
     }
 
-    fn prepare_attention_bias(
-        &self,
-        batch: &Batch,
-        input_lengths: &[f32],
-    ) -> Result<Option<Tensor>> {
-        let batch_size = batch.len();
-        let max_length = batch.max_length as usize;
-
-        if batch_size <= 1 {
-            return Ok(None);
-        }
-
-        let mut attention_bias = Vec::with_capacity(batch_size * max_length);
-        let mut needs_masking = false;
-
-        for &length in input_lengths.iter() {
-            let seq_length = length as usize;
-            for _ in 0..seq_length {
-                attention_bias.push(0.0_f32);
+    fn _get_attention_mask(&self, mut attention_mask: Tensor) -> Result<Tensor> {
+        match attention_mask.dims().len() {
+            2 => {
+                let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
+                attention_mask = extended_attention_mask.broadcast_mul(
+                    &extended_attention_mask
+                        .squeeze(D::Minus2)?
+                        .unsqueeze(D::Minus1)?,
+                )?;
             }
-            let padding = max_length - seq_length;
-            if padding > 0 {
-                needs_masking = true;
-                for _ in 0..padding {
-                    attention_bias.push(f32::NEG_INFINITY);
-                }
-            }
+            3 => attention_mask = attention_mask.unsqueeze(1)?,
+            4 => {}
+            len => bail!("Unsupported attention mask dimensions: {len}"),
         }
-
-        if needs_masking {
-            Ok(Some(
-                Tensor::from_vec(attention_bias, (batch_size, 1, 1, max_length), &self.device)?
-                    .to_dtype(self.dtype)?,
-            ))
-        } else {
-            Ok(None)
-        }
+        attention_mask.to_dtype(self.dtype)
     }
 
     fn pool_embeddings(
