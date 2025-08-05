@@ -349,6 +349,9 @@ impl DeBertaDisentangledSelfAttention {
         let n_head = self.num_attention_heads;
         let bs = total_bs_heads / n_head;
 
+        let scale_tensor =
+            Tensor::new(scale as f32, query_layer.device())?.to_dtype(query_layer.dtype())?;
+
         let att_span = if self.position_buckets > 0 {
             self.position_buckets
         } else {
@@ -401,14 +404,6 @@ impl DeBertaDisentangledSelfAttention {
             };
 
             let pos_key_layer = reshape_pos_embedding(pos_key)?;
-
-            let scale_tensor = Tensor::new(
-                &[(pos_key_layer.dim(D::Minus1)? as f64 * scale) as f32],
-                query_layer.device(),
-            )?
-            .sqrt()?
-            .to_dtype(query_layer.dtype())?;
-
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
 
             let c2p_pos = relative_pos
@@ -452,24 +447,14 @@ impl DeBertaDisentangledSelfAttention {
                 .contiguous()?;
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
-
-            let scale_tensor = Tensor::new(
-                &[(pos_query_layer.dim(D::Minus1)? as f64 * scale) as f32],
-                key_layer.device(),
-            )?
-            .sqrt()?
-            .to_dtype(query_layer.dtype())?;
-
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
             let p2c_att = p2c_att.gather(&p2c_pos, 2)?.transpose(1, 2)?;
-
             score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
         }
 
         Ok(score)
     }
 }
-
 struct DeBertaAttention {
     self_attention: DeBertaDisentangledSelfAttention,
     dense: Linear,
