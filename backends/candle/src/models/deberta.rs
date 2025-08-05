@@ -169,21 +169,22 @@ struct XSoftmax {}
 
 impl XSoftmax {
     fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
-        // Invert the mask: 1.0 for valid tokens, 0.0 for padding becomes 0 for valid, 1 for padding.
-        let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
-        rmask = rmask
-            .broadcast_lt(&Tensor::new(&[1.0_f32], device)?)?
+        // Invert the mask: 1.0 for valid tokens, 0.0 for padding becomes 1 for padding, 0 for valid.
+        let rmask = mask
+            .broadcast_as(input.shape())?
+            .lt(1.0f32)?
             .to_dtype(DType::U8)?;
 
-        let min_value_tensor = Tensor::new(f32::MIN, device)?
+        let min_value_tensor = Tensor::new(&[f32::MIN], device)?
             .to_dtype(input.dtype())?
             .broadcast_as(input.shape())?;
         let mut output = rmask.where_cond(&min_value_tensor, input)?;
 
         output = candle_nn::ops::softmax(&output, dim)?;
 
-        // Zero out the probabilities for padded tokens.
-        let t_zeroes = Tensor::zeros_like(&output)?;
+        let t_zeroes = Tensor::new(&[0f32], device)?
+            .to_dtype(output.dtype())?
+            .broadcast_as(output.shape())?;
         output = rmask.where_cond(&t_zeroes, &output)?;
 
         Ok(output)
