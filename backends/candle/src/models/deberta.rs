@@ -45,6 +45,8 @@ pub struct DeBertaConfig {
     pub conv_groups: Option<usize>,
     #[serde(default)]
     pub conv_act: Option<String>,
+    #[serde(default)]
+    pub embedding_size: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -52,6 +54,9 @@ pub struct DeBertaEmbeddings {
     word_embeddings: Embedding,
     position_embeddings: Option<Embedding>,
     token_type_embeddings: Option<Embedding>,
+    embed_proj: Option<Linear>,
+    embedding_size: usize,
+    hidden_size: usize,
     layer_norm: LayerNorm,
     position_biased_input: bool,
     span: tracing::Span,
@@ -60,35 +65,49 @@ pub struct DeBertaEmbeddings {
 impl DeBertaEmbeddings {
     pub fn load(vb: VarBuilder, config: &DeBertaConfig) -> Result<Self> {
         let position_biased_input = config.position_biased_input.unwrap_or(true);
+        let embedding_size = config.embedding_size.unwrap_or(config.hidden_size);
+        let hidden_size = config.hidden_size;
 
         let word_embeddings = Embedding::new(
             vb.pp("word_embeddings")
-                .get((config.vocab_size, config.hidden_size), "weight")?,
-            config.hidden_size,
+                .get((config.vocab_size, embedding_size), "weight")?,
+            embedding_size,
         );
 
         let position_embeddings = if position_biased_input {
             Some(Embedding::new(
-                vb.pp("position_embeddings").get(
-                    (config.max_position_embeddings, config.hidden_size),
-                    "weight",
-                )?,
-                config.hidden_size,
+                vb.pp("position_embeddings")
+                    .get((config.max_position_embeddings, embedding_size), "weight")?,
+                embedding_size,
             ))
         } else {
             None
         };
 
+        // token_type_embeddings are projected from hidden_size
         let token_type_embeddings = if config.type_vocab_size > 0 {
             match vb
                 .pp("token_type_embeddings")
-                .get((config.type_vocab_size, config.hidden_size), "weight")
+                .get((config.type_vocab_size, hidden_size), "weight")
             {
-                Ok(w) => Some(Embedding::new(w, config.hidden_size)),
+                Ok(w) => Some(Embedding::new(w, hidden_size)),
                 Err(_) => candle::bail!(
                     "configuration type_vocab_size > 0 but no token_type_embeddings in the model"
                 ),
             }
+        } else {
+            None
+        };
+
+        // Conditionally load the projection layer
+        let embed_proj = if embedding_size != hidden_size {
+            let proj = Linear::new(
+                vb.pp("embed_proj")
+                    .get((hidden_size, embedding_size), "weight")?,
+                None, // embed_proj has no bias
+                None,
+            );
+            Some(proj)
         } else {
             None
         };
@@ -103,6 +122,9 @@ impl DeBertaEmbeddings {
             word_embeddings,
             position_embeddings,
             token_type_embeddings,
+            embed_proj,
+            embedding_size,
+            hidden_size,
             layer_norm,
             position_biased_input,
             span: tracing::span!(tracing::Level::TRACE, "embeddings"),
@@ -121,9 +143,16 @@ impl DeBertaEmbeddings {
         if let Some(ref position_embeddings) = self.position_embeddings {
             embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
         }
+
+        // The projection happens before adding token_type_embeddings and LayerNorm
+        if let Some(proj) = &self.embed_proj {
+            embeddings = proj.forward(&embeddings)?;
+        }
+
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
+
         let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
 
         if let Some(mask) = attention_mask {
@@ -134,6 +163,7 @@ impl DeBertaEmbeddings {
         Ok(embeddings)
     }
 }
+
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L72
 struct XSoftmax {}
 
