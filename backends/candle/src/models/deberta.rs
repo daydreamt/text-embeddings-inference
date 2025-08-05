@@ -268,22 +268,47 @@ impl DeBertaDisentangledSelfAttention {
             attention_scores = attention_scores.add(&rel_att)?;
         }
 
-        let max_scores = attention_scores
-            .max_keepdim(D::Minus1)?
-            .broadcast_as(attention_scores.shape())?;
-        attention_scores = attention_scores.broadcast_sub(&max_scores)?;
-
         if let Some(attention_mask) = attention_mask {
-            let (b, _, _, k) = attention_mask.dims4()?;
-            let attention_mask = attention_mask.reshape((b, k))?.unsqueeze(1)?.repeat((
+            // Reshape attention mask similar to Candle
+            let attention_mask = match attention_mask.dims().len() {
+                2 => {
+                    let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
+                    extended_attention_mask.broadcast_mul(
+                        &extended_attention_mask
+                            .squeeze(D::Minus2)?
+                            .unsqueeze(D::Minus1)?,
+                    )?
+                }
+                3 => attention_mask.unsqueeze(1)?,
+                4 => attention_mask.clone(),
+                _ => bail!("Unsupported attention mask dimensions"),
+            };
+            
+            attention_scores = attention_scores.reshape((
+                batch_size,
                 self.num_attention_heads,
-                1,
-                1,
+                seq_len,
+                seq_len,
             ))?;
-            attention_scores = attention_scores.broadcast_add(&attention_mask)?
+            
+            let mut rmask = attention_mask.broadcast_as(attention_scores.shape())?.to_dtype(DType::F32)?;
+            rmask = rmask
+                .broadcast_lt(&Tensor::new(&[1.0_f32], attention_scores.device())?)?
+                .to_dtype(DType::U8)?;
+            
+            let min_value_tensor = Tensor::new(&[f32::MIN], attention_scores.device())?.broadcast_as(attention_scores.shape())?;
+            attention_scores = rmask.where_cond(&min_value_tensor, &attention_scores)?;
         }
 
         let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
+        
+        // Reshape back for matmul
+        let attention_probs = attention_probs.reshape((
+            batch_size * self.num_attention_heads,
+            seq_len,
+            seq_len,
+        ))?;
+        
         let context_layer = attention_probs.matmul(&value_layer)?;
 
         context_layer
@@ -333,6 +358,7 @@ impl DeBertaDisentangledSelfAttention {
             self.max_relative_positions
         };
 
+        // Handle relative_pos dimensions like Candle
         let relative_pos = match relative_pos.dims().len() {
             2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
             3 => relative_pos.unsqueeze(1)?,
@@ -357,6 +383,7 @@ impl DeBertaDisentangledSelfAttention {
             query_layer.device(),
         )?;
 
+        // Port from Candle: Updated reshape function
         let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
             pos_embedding
                 .reshape((2 * att_span as usize, n_head, d_head))?
@@ -377,26 +404,27 @@ impl DeBertaDisentangledSelfAttention {
                     None => return Err(candle::Error::Msg("pos_key_proj not found".to_string())),
                 }
             };
-            println!("TEI c2p - share_att_key: {}", self.share_att_key);
-            println!("TEI c2p - pos_key shape: {:?}", pos_key.shape());
-
-
-            let c2p_pos_idx = (relative_pos
-                .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?)
-            .clamp(0i64, 2 * att_span - 1)?
-            .to_dtype(DType::U32)?
-            .contiguous()?;
-
-            //println!("TEI c2p - c2p_pos_idx first 10 values: {:?}",
-            //c2p_pos_idx.flatten_all()?.to_vec1::<u32>()?.iter().take(10).collect::<Vec<_>>());
-
 
             let pos_key_layer = reshape_pos_embedding(pos_key)?;
+            
+            // Port from Candle: Different scale calculation
+            let scale_tensor = Tensor::new(
+                &[(pos_key_layer.dim(D::Minus1)? as f64 * scale) as f32],
+                query_layer.device(),
+            )?
+            .sqrt()?
+            .to_dtype(query_layer.dtype())?;
+            
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
-            let c2p_att = c2p_att.contiguous()?.gather(&c2p_pos_idx, 2)?;
-            println!("TEI c2p - c2p_att shape before gather: {:?}", c2p_att.shape());
-
-            score = score.add(&(c2p_att / scale)?)?;
+            
+            let c2p_pos = relative_pos
+                .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?
+                .clamp(0i64, 2 * att_span - 1)?
+                .to_dtype(DType::U32)?
+                .contiguous()?;
+            
+            let c2p_att = c2p_att.gather(&c2p_pos, 2)?;
+            score = score.add(&c2p_att.broadcast_div(&scale_tensor)?)?;
         }
 
         if self.pos_att_type.iter().any(|s| s == "p2c") {
@@ -421,35 +449,31 @@ impl DeBertaDisentangledSelfAttention {
                 relative_pos.clone()
             };
 
-            println!("TEI p2c - r_pos differs from relative_pos: {}",
-            if key_layer.dim(1)? != query_layer.dim(1)? { "yes" } else { "no" });
-
-            // ENH: .neg() currently not implemented for metal backend for I64
-            let p2c_pos_idx = Tensor::new(att_span, relative_pos.device())?
-            .broadcast_sub(&r_pos)?
-            .clamp(0i64, 2 * att_span - 1)?
-            .to_dtype(DType::U32)?
-            .contiguous()?;
-
-            //println!("TEI p2c - p2c_pos_idx first 10 values: {:?}",
-            //    p2c_pos_idx.flatten_all()?.to_vec1::<u32>()?.iter().take(10).collect::<Vec<_>>());
+            // Port from Candle: Use neg() and proper clamping
+            let p2c_pos = r_pos
+                .to_dtype(DType::F32)?
+                .neg()?
+                .broadcast_add(&Tensor::new(&[att_span as f32], relative_pos.device())?)?
+                .clamp(0f32, (2 * att_span - 1) as f32)?
+                .to_dtype(DType::U32)?
+                .contiguous()?;
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
-            println!("TEI p2c - pos_query_layer shape: {:?}", pos_query_layer.shape());
-
+            
+            // Port from Candle: Different scale calculation
+            let scale_tensor = Tensor::new(
+                &[(pos_query_layer.dim(D::Minus1)? as f64 * scale) as f32],
+                key_layer.device(),
+            )?
+            .sqrt()?
+            .to_dtype(query_layer.dtype())?;
+            
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
-            let p2c_att = (p2c_att / scale)?;
-            let p2c_att = p2c_att.gather(&p2c_pos_idx, 2)?.transpose(1, 2)?;
-
-            println!("TEI p2c - p2c_att shape before gather: {:?}", p2c_att.shape());
-            println!("TEI p2c - p2c_att sum before scale: {}", p2c_att.sum_all()?);
-
-            let p2c_sum = p2c_att.sum_all()?;
-            println!("  p2c_att sum: {}", p2c_sum);
-
-            score = score.add(&p2c_att)?;
+            let p2c_att = p2c_att.gather(&p2c_pos, 2)?.transpose(1, 2)?;
+            
+            score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
         }
-        println!("TEI - final score sum: {}", score.sum_all()?);
+        
         Ok(score)
     }
 }
@@ -1057,7 +1081,6 @@ impl Model for DeBertaModel {
     }
 }
 
-// https://github.com/huggingface/candle/blob/26a3222d557caefab41b9c3e63a08213c32e5472/candle-transformers/src/models/debertav2.rs#L1368
 pub(crate) fn build_relative_position(
     query_size: usize,
     key_size: usize,
@@ -1080,7 +1103,6 @@ pub(crate) fn build_relative_position(
     rel_pos_ids.unsqueeze(0)
 }
 
-// https://github.com/huggingface/candle/blob/42bd33e0a6c114838e623e5e11fb466628888bbf/candle-transformers/src/models/debertav2.rs#L1390
 pub(crate) fn make_log_bucket_position(
     relative_pos: Tensor,
     bucket_size: isize,
