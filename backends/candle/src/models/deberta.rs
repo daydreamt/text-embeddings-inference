@@ -144,13 +144,12 @@ impl DeBertaEmbeddings {
             embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
         }
 
-        // The projection happens before adding token_type_embeddings and LayerNorm
-        if let Some(proj) = &self.embed_proj {
-            embeddings = proj.forward(&embeddings)?;
-        }
-
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
+        }
+
+        if let Some(proj) = &self.embed_proj {
+            embeddings = proj.forward(&embeddings)?;
         }
 
         let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
