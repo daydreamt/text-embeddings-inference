@@ -155,7 +155,6 @@ impl DeBertaEmbeddings {
         let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
 
         if let Some(mask) = attention_mask {
-            // Fixed: Match Candle's mask handling logic
             let mut mask = mask.clone();
             if mask.dims() != embeddings.dims() {
                 if mask.dims().len() == 4 {
@@ -176,10 +175,10 @@ struct XSoftmax {}
 
 impl XSoftmax {
     fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
-        // Invert the mask: 1.0 for valid tokens, 0.0 for padding becomes 1 for padding, 0 for valid.
-        let rmask = mask
-            .broadcast_as(input.shape())?
-            .lt(1.0f32)?
+        let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
+
+        rmask = rmask
+            .broadcast_lt(&Tensor::new(&[1.0_f32], device)?)?
             .to_dtype(DType::U8)?;
 
         let min_value_tensor = Tensor::new(&[f32::MIN], device)?
@@ -460,7 +459,7 @@ impl DeBertaDisentangledSelfAttention {
                     .squeeze(0)?
                     .expand(&[total_bs_heads, q_len, k_len])?
                     .contiguous()?,
-                D::Minus1,  // Changed from 2
+                D::Minus1, // Changed from 2
             )?;
             score = score.add(&c2p_att.broadcast_div(&scale_tensor)?)?;
         }
@@ -497,20 +496,21 @@ impl DeBertaDisentangledSelfAttention {
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
             // Fixed: Use D::Minus1 instead of 2
-            let p2c_att = p2c_att.gather(
-                &p2c_pos
-                    .squeeze(0)?
-                    .squeeze(0)?
-                    .expand(&[total_bs_heads, k_len, k_len])?
-                    .contiguous()?,
-                D::Minus1,  // Changed from 2
-            )?.transpose(1, 2)?;
+            let p2c_att = p2c_att
+                .gather(
+                    &p2c_pos
+                        .squeeze(0)?
+                        .squeeze(0)?
+                        .expand(&[total_bs_heads, k_len, k_len])?
+                        .contiguous()?,
+                    D::Minus1, // Changed from 2
+                )?
+                .transpose(1, 2)?;
             score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
         }
 
         Ok(score)
     }
-
 }
 struct DeBertaAttention {
     self_attention: DeBertaDisentangledSelfAttention,
@@ -919,7 +919,6 @@ impl DeBertaModel {
         let batch_len = batch.len();
         let max_length = batch.max_length as usize;
 
-        // First, calculate the length of each sequence in the batch
         let mut input_lengths = Vec::with_capacity(batch_len);
         for i in 0..batch_len {
             let length =
@@ -927,17 +926,17 @@ impl DeBertaModel {
             input_lengths.push(length);
         }
 
-        // MODIFIED: Create a standard 2D attention mask from the sequence lengths.
-        // The `Batch` struct does not have an `attention_mask` field; we must build it.
         let mut attention_mask_vec = Vec::with_capacity(batch_len * max_length);
         for &seq_len in &input_lengths {
-            // 1 for valid tokens
-            attention_mask_vec.extend(std::iter::repeat(1u8).take(seq_len));
-            // 0 for padding
-            attention_mask_vec.extend(std::iter::repeat(0u8).take(max_length - seq_len));
+            // Use 1.0f32 for valid tokens
+            attention_mask_vec.extend(std::iter::repeat(1.0f32).take(seq_len));
+            // Use 0.0f32 for padding
+            attention_mask_vec.extend(std::iter::repeat(0.0f32).take(max_length - seq_len));
         }
         let attention_mask_2d =
-            Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?;
+            Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?
+                .to_dtype(self.dtype)?; // Ensure it's in the model's dtype
+
         let attention_mask_4d = self._get_attention_mask(attention_mask_2d.clone())?;
 
         // The pooling logic downstream requires f32 lengths.
