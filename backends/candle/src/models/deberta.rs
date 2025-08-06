@@ -328,7 +328,7 @@ impl DeBertaDisentangledSelfAttention {
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
 
         let scale_tensor =
-            Tensor::new(&[scale as f32], &self.device)?.to_dtype(key_layer.dtype())?;
+            Tensor::new(&[scale as f32], query_layer.device())?.to_dtype(query_layer.dtype())?;
         let mut attention_scores =
             query_layer.matmul(&key_layer.t()?.broadcast_div(&scale_tensor)?)?;
 
@@ -367,21 +367,21 @@ impl DeBertaDisentangledSelfAttention {
     }
 
     fn transpose_for_scores(&self, x: Tensor, batch_size: usize, seq_len: usize) -> Result<Tensor> {
-        x.reshape((
+        let reshaped = x.reshape((
             batch_size,
             seq_len,
             self.num_attention_heads,
             self.attention_head_size,
-        ))?
-        .transpose(1, 2)?
-        .contiguous()?
-        .reshape((
+        ))?;
+
+        let transposed = reshaped.transpose(1, 2)?.contiguous()?;
+
+        transposed.reshape((
             batch_size * self.num_attention_heads,
-            seq_len,
-            self.attention_head_size,
+            transposed.dim(2)?, // This should be seq_len, but get it from tensor
+            transposed.dim(3)?, // This should be attention_head_size
         ))
     }
-
     fn disentangled_attention_bias(
         &self,
         query_layer: &Tensor,
@@ -447,12 +447,11 @@ impl DeBertaDisentangledSelfAttention {
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
 
             let c2p_pos = relative_pos
-                .broadcast_add(&Tensor::new(att_span, relative_pos.device())?)?
+                .broadcast_add(&Tensor::new(&[att_span as i64], relative_pos.device())?)?
                 .clamp(0i64, 2 * att_span - 1)?
                 .to_dtype(DType::U32)?
                 .contiguous()?;
 
-            // Fixed: Use D::Minus1 instead of 2
             let c2p_att = c2p_att.gather(
                 &c2p_pos
                     .squeeze(0)?
@@ -485,6 +484,7 @@ impl DeBertaDisentangledSelfAttention {
             } else {
                 relative_pos.clone()
             };
+
             let p2c_pos = r_pos
                 .to_dtype(DType::F32)?
                 .neg()?
@@ -495,7 +495,6 @@ impl DeBertaDisentangledSelfAttention {
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
-            // Fixed: Use D::Minus1 instead of 2
             let p2c_att = p2c_att
                 .gather(
                     &p2c_pos
