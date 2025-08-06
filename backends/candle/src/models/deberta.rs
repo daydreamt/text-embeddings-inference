@@ -138,21 +138,32 @@ impl DeBertaEmbeddings {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaEmbeddings::forward] START. input_ids shape: {:?}", input_ids.shape());
+
         let mut embeddings = self.word_embeddings.forward(input_ids)?;
+        println!("[F1 DeBertaEmbeddings::forward] After word_embeddings. Shape: {:?}, Sum: {:?}", embeddings.shape(), embeddings.sum_all());
 
         if let Some(ref position_embeddings) = self.position_embeddings {
-            embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
+            let pos_embeds = position_embeddings.forward(position_ids)?;
+            println!("[F1 DeBertaEmbeddings::forward] Applying position_embeddings. Shape: {:?}, Sum: {:?}", pos_embeds.shape(), pos_embeds.sum_all());
+            embeddings = embeddings.add(&pos_embeds)?;
         }
+        println!("[F1 DeBertaEmbeddings::forward] After position_embeddings. Shape: {:?}, Sum: {:?}", embeddings.shape(), embeddings.sum_all());
 
         if let Some(proj) = &self.embed_proj {
             embeddings = proj.forward(&embeddings)?;
+            println!("[F1 DeBertaEmbeddings::forward] After embed_proj. Shape: {:?}, Sum: {:?}", embeddings.shape(), embeddings.sum_all());
         }
 
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
-            embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
+            let tte = token_type_embeddings.forward(token_type_ids)?;
+            println!("[F1 DeBertaEmbeddings::forward] Applying token_type_embeddings. Shape: {:?}, Sum: {:?}", tte.shape(), tte.sum_all());
+            embeddings = embeddings.add(&tte)?;
         }
+        println!("[F1 DeBertaEmbeddings::forward] After token_type_embeddings. Shape: {:?}, Sum: {:?}", embeddings.shape(), embeddings.sum_all());
 
         let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
+        println!("[F1 DeBertaEmbeddings::forward] After layer_norm. Shape: {:?}, Sum: {:?}", embeddings.shape(), embeddings.sum_all());
 
         if let Some(mask) = attention_mask {
             let mut mask = mask.clone();
@@ -164,8 +175,10 @@ impl DeBertaEmbeddings {
             }
             mask = mask.to_dtype(embeddings.dtype())?;
             embeddings = embeddings.broadcast_mul(&mask)?;
+            println!("[F1 DeBertaEmbeddings::forward] After masking. Shape: {:?}, Sum: {:?}", embeddings.shape(), embeddings.sum_all());
         }
 
+        println!("[F1 DeBertaEmbeddings::forward] END. Final shape: {:?}", embeddings.shape());
         Ok(embeddings)
     }
 }
@@ -175,23 +188,29 @@ struct XSoftmax {}
 
 impl XSoftmax {
     fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
+        println!("[F1 XSoftmax::apply] START. input shape: {:?}, mask shape: {:?}", input.shape(), mask.shape());
         let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
+        println!("[F1 XSoftmax::apply] rmask pre-logic shape: {:?}", rmask.shape());
 
         rmask = rmask
             .broadcast_lt(&Tensor::new(&[1.0_f32], device)?)?
             .to_dtype(DType::U8)?;
+        println!("[F1 XSoftmax::apply] rmask post-logic shape: {:?}", rmask.shape());
 
         let min_value_tensor = Tensor::new(&[f32::MIN], device)?
             .to_dtype(input.dtype())?
             .broadcast_as(input.shape())?;
         let mut output = rmask.where_cond(&min_value_tensor, input)?;
+        println!("[F1 XSoftmax::apply] after where_cond with MIN. Shape: {:?}, Sum: {:?}", output.shape(), output.sum_all());
 
         output = candle_nn::ops::softmax(&output, dim)?;
+        println!("[F1 XSoftmax::apply] after softmax. Shape: {:?}, Sum: {:?}", output.shape(), output.sum_all());
 
         let t_zeroes = Tensor::new(&[0f32], device)?
             .to_dtype(output.dtype())?
             .broadcast_as(output.shape())?;
         output = rmask.where_cond(&t_zeroes, &output)?;
+        println!("[F1 XSoftmax::apply] after where_cond with ZEROS. Shape: {:?}, Sum: {:?}", output.shape(), output.sum_all());
 
         Ok(output)
     }
@@ -303,20 +322,23 @@ impl DeBertaDisentangledSelfAttention {
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] START. hidden_states shape: {:?}, attention_mask shape: {:?}", hidden_states.shape(), attention_mask.shape());
         let (batch_size, seq_len, _) = hidden_states.dims3()?;
 
-        let query_layer = self.transpose_for_scores(
-            self.query_proj.forward(hidden_states)?,
-            batch_size,
-            seq_len,
-        )?;
-        let key_layer =
-            self.transpose_for_scores(self.key_proj.forward(hidden_states)?, batch_size, seq_len)?;
-        let value_layer = self.transpose_for_scores(
-            self.value_proj.forward(hidden_states)?,
-            batch_size,
-            seq_len,
-        )?;
+        let q_proj = self.query_proj.forward(hidden_states)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] q_proj shape: {:?}", q_proj.shape());
+        let query_layer = self.transpose_for_scores(q_proj, batch_size, seq_len)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] query_layer shape: {:?}", query_layer.shape());
+
+        let k_proj = self.key_proj.forward(hidden_states)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] k_proj shape: {:?}", k_proj.shape());
+        let key_layer = self.transpose_for_scores(k_proj, batch_size, seq_len)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] key_layer shape: {:?}", key_layer.shape());
+
+        let v_proj = self.value_proj.forward(hidden_states)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] v_proj shape: {:?}", v_proj.shape());
+        let value_layer = self.transpose_for_scores(v_proj, batch_size, seq_len)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] value_layer shape: {:?}", value_layer.shape());
 
         let mut scale_factor = 1.0;
         if self.pos_att_type.iter().any(|s| s == "c2p") {
@@ -326,13 +348,16 @@ impl DeBertaDisentangledSelfAttention {
             scale_factor += 1.0;
         }
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] scale: {}", scale);
 
         let scale_tensor =
             Tensor::new(&[scale as f32], query_layer.device())?.to_dtype(query_layer.dtype())?;
         let mut attention_scores =
             query_layer.matmul(&key_layer.t()?.broadcast_div(&scale_tensor)?)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] attention_scores (content). Shape: {:?}, Sum: {:?}", attention_scores.shape(), attention_scores.sum_all());
 
         if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
+            println!("[F1 DeBertaDisentangledSelfAttention::forward] Applying disentangled_attention_bias.");
             let rel_att = self.disentangled_attention_bias(
                 &query_layer,
                 &key_layer,
@@ -340,21 +365,27 @@ impl DeBertaDisentangledSelfAttention {
                 rel_embeddings,
                 scale,
             )?;
+            println!("[F1 DeBertaDisentangledSelfAttention::forward] rel_att shape: {:?}, Sum: {:?}", rel_att.shape(), rel_att.sum_all());
             attention_scores = attention_scores.add(&rel_att)?;
+            println!("[F1 DeBertaDisentangledSelfAttention::forward] attention_scores (content+relative). Shape: {:?}, Sum: {:?}", attention_scores.shape(), attention_scores.sum_all());
         }
 
         let attention_scores =
             attention_scores.reshape((batch_size, self.num_attention_heads, seq_len, seq_len))?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] attention_scores reshaped (pre-softmax). Shape: {:?}", attention_scores.shape());
 
         let attention_probs =
             XSoftmax::apply(&attention_scores, attention_mask, D::Minus1, &self.device)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] attention_probs from XSoftmax. Shape: {:?}, Sum: {:?}", attention_probs.shape(), attention_probs.sum_all());
 
         let attention_probs =
             attention_probs.reshape((batch_size * self.num_attention_heads, seq_len, seq_len))?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] attention_probs reshaped. Shape: {:?}", attention_probs.shape());
 
         let context_layer = attention_probs.matmul(&value_layer)?;
+        println!("[F1 DeBertaDisentangledSelfAttention::forward] context_layer. Shape: {:?}, Sum: {:?}", context_layer.shape(), context_layer.sum_all());
 
-        context_layer
+        let final_context = context_layer
             .reshape((
                 batch_size,
                 self.num_attention_heads,
@@ -363,7 +394,13 @@ impl DeBertaDisentangledSelfAttention {
             ))?
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((batch_size, seq_len, self.all_head_size))
+            .reshape((batch_size, seq_len, self.all_head_size));
+
+        if let Ok(ref final_context_tensor) = final_context {
+            println!("[F1 DeBertaDisentangledSelfAttention::forward] END. final_context shape: {:?}", final_context_tensor.shape());
+        }
+        
+        final_context
     }
 
     fn transpose_for_scores(&self, x: Tensor, batch_size: usize, seq_len: usize) -> Result<Tensor> {
@@ -390,6 +427,7 @@ impl DeBertaDisentangledSelfAttention {
         rel_embeddings: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
+        println!("[F1 disentangled_attention_bias] START. query_layer shape: {:?}, rel_embeddings shape: {:?}", query_layer.shape(), rel_embeddings.shape());
         let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
         let k_len = key_layer.dim(1)?;
         let n_head = self.num_attention_heads;
@@ -421,6 +459,7 @@ impl DeBertaDisentangledSelfAttention {
             query_layer.dtype(),
             query_layer.device(),
         )?;
+        println!("[F1 disentangled_attention_bias] Initial score shape: {:?}", score.shape());
 
         let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
             pos_embedding
@@ -434,6 +473,7 @@ impl DeBertaDisentangledSelfAttention {
         };
 
         if self.pos_att_type.iter().any(|s| s == "c2p") {
+            println!("[F1 disentangled_attention_bias] Calculating c2p attention.");
             let pos_key = if self.share_att_key {
                 self.key_proj.forward(&rel_embeddings)?
             } else {
@@ -460,10 +500,13 @@ impl DeBertaDisentangledSelfAttention {
                     .contiguous()?,
                 D::Minus1, // Changed from 2
             )?;
+            println!("[F1 disentangled_attention_bias] c2p_att gathered shape: {:?}, Sum: {:?}", c2p_att.shape(), c2p_att.sum_all());
             score = score.add(&c2p_att.broadcast_div(&scale_tensor)?)?;
+            println!("[F1 disentangled_attention_bias] score after c2p. Sum: {:?}", score.sum_all());
         }
 
         if self.pos_att_type.iter().any(|s| s == "p2c") {
+            println!("[F1 disentangled_attention_bias] Calculating p2c attention.");
             let pos_query = if self.share_att_key {
                 self.query_proj.forward(&rel_embeddings)?
             } else {
@@ -505,9 +548,12 @@ impl DeBertaDisentangledSelfAttention {
                     D::Minus1, // Changed from 2
                 )?
                 .transpose(1, 2)?;
+            println!("[F1 disentangled_attention_bias] p2c_att gathered&transposed shape: {:?}, Sum: {:?}", p2c_att.shape(), p2c_att.sum_all());
             score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
+            println!("[F1 disentangled_attention_bias] score after p2c. Sum: {:?}", score.sum_all());
         }
 
+        println!("[F1 disentangled_attention_bias] END. Final score shape: {:?}", score.shape());
         Ok(score)
     }
 }
@@ -553,15 +599,26 @@ impl DeBertaAttention {
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaAttention::forward] START. hidden_states shape: {:?}", hidden_states.shape());
+
         let self_output = self.self_attention.forward(
             hidden_states,
             attention_mask,
             relative_embeddings,
             relative_pos,
         )?;
+        println!("[F1 DeBertaAttention::forward] After self_attention. Shape: {:?}, Sum: {:?}", self_output.shape(), self_output.sum_all());
+
         let attention_output = self.dense.forward(&self_output)?;
-        self.layer_norm
-            .forward(&attention_output, Some(hidden_states))
+        println!("[F1 DeBertaAttention::forward] After dense. Shape: {:?}, Sum: {:?}", attention_output.shape(), attention_output.sum_all());
+
+        let result = self.layer_norm
+            .forward(&attention_output, Some(hidden_states));
+
+        if let Ok(ref res) = result {
+             println!("[F1 DeBertaAttention::forward] END. After layer_norm. Shape: {:?}, Sum: {:?}", res.shape(), res.sum_all());
+        }
+        result
     }
 }
 
@@ -621,16 +678,29 @@ impl DeBertaLayer {
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaLayer::forward] START. hidden_states shape: {:?}", hidden_states.shape());
+
         let attention_output = self.attention.forward(
             hidden_states,
             attention_mask,
             relative_embeddings,
             relative_pos,
         )?;
+        println!("[F1 DeBertaLayer::forward] After attention. Shape: {:?}, Sum: {:?}", attention_output.shape(), attention_output.sum_all());
+
         let intermediate_output = self.intermediate.forward(&attention_output)?;
+        println!("[F1 DeBertaLayer::forward] After intermediate. Shape: {:?}, Sum: {:?}", intermediate_output.shape(), intermediate_output.sum_all());
+
         let layer_output = self.output.forward(&intermediate_output)?;
-        self.layer_norm
-            .forward(&layer_output, Some(&attention_output))
+        println!("[F1 DeBertaLayer::forward] After output. Shape: {:?}, Sum: {:?}", layer_output.shape(), layer_output.sum_all());
+
+        let result = self.layer_norm
+            .forward(&layer_output, Some(&attention_output));
+        
+        if let Ok(ref res) = result {
+            println!("[F1 DeBertaLayer::forward] END. After layer_norm. Shape: {:?}, Sum: {:?}", res.shape(), res.sum_all());
+        }
+        result
     }
 }
 
@@ -749,19 +819,30 @@ impl DeBertaEncoder {
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaEncoder::forward] START. hidden_states shape: {:?}", hidden_states.shape());
 
         let relative_pos = self.get_rel_pos(hidden_states)?;
+        if let Some(ref rp) = relative_pos {
+             println!("[F1 DeBertaEncoder::forward] Got relative_pos. Shape: {:?}", rp.shape());
+        }
+
         let relative_embeddings = self.get_rel_embedding()?;
+        if let Some(ref re) = relative_embeddings {
+             println!("[F1 DeBertaEncoder::forward] Got relative_embeddings. Shape: {:?}", re.shape());
+        }
 
         let mut current_hidden_states = hidden_states.clone();
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            println!("[F1 DeBertaEncoder::forward] >> Layer {i} START. Shape: {:?}", current_hidden_states.shape());
             current_hidden_states = layer.forward(
                 &current_hidden_states,
                 attention_mask,
                 relative_embeddings.as_ref(),
                 relative_pos.as_ref(),
             )?;
+            println!("[F1 DeBertaEncoder::forward] >> Layer {i} END. Shape: {:?}, Sum: {:?}", current_hidden_states.shape(), current_hidden_states.sum_all());
         }
+        println!("[F1 DeBertaEncoder::forward] END. Final hidden_states shape: {:?}", current_hidden_states.shape());
         Ok(current_hidden_states)
     }
 }
@@ -840,9 +921,13 @@ impl DeBertaPooler {
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaPooler::forward] START. hidden_states shape: {:?}", hidden_states.shape());
 
         let first_token = hidden_states.i((.., 0))?;
+        println!("[F1 DeBertaPooler::forward] first_token shape: {:?}", first_token.shape());
+
         let pooled = self.dense.forward(&first_token)?;
+        println!("[F1 DeBertaPooler::forward] after dense. Shape: {:?}, Sum: {:?}", pooled.shape(), pooled.sum_all());
 
         let activated = match self.activation {
             HiddenAct::Gelu => pooled.gelu(),
@@ -850,11 +935,17 @@ impl DeBertaPooler {
             HiddenAct::Silu => pooled.silu(),
             _ => unreachable!("Invalid activation should have been caught during loading"),
         }?;
+        println!("[F1 DeBertaPooler::forward] after activation. Shape: {:?}, Sum: {:?}", activated.shape(), activated.sum_all());
 
-        match &self.classifier {
+        let result = match &self.classifier {
             Some(classifier) => classifier.forward(&activated),
             None => Ok(activated),
+        };
+
+        if let Ok(ref res) = result {
+            println!("[F1 DeBertaPooler::forward] END. Final output shape: {:?}", res.shape());
         }
+        result
     }
 
     pub fn is_classifier(&self) -> bool {
@@ -915,6 +1006,7 @@ impl DeBertaModel {
 
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let _enter = self.span.enter();
+        println!("[F1 DeBertaModel::forward] START. batch len: {}, max_length: {}", batch.len(), batch.max_length);
         let batch_len = batch.len();
         let max_length = batch.max_length as usize;
 
@@ -935,8 +1027,10 @@ impl DeBertaModel {
         let attention_mask_2d =
             Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?
                 .to_dtype(self.dtype)?; // Ensure it's in the model's dtype
+        println!("[F1 DeBertaModel::forward] attention_mask_2d shape: {:?}", attention_mask_2d.shape());
 
         let attention_mask_4d = self._get_attention_mask(attention_mask_2d.clone())?;
+        println!("[F1 DeBertaModel::forward] attention_mask_4d shape: {:?}", attention_mask_4d.shape());
 
         // The pooling logic downstream requires f32 lengths.
         let input_lengths_f32: Vec<f32> = input_lengths.iter().map(|&l| l as f32).collect();
@@ -946,21 +1040,26 @@ impl DeBertaModel {
         let type_ids = Tensor::from_vec(batch.token_type_ids.clone(), shape, &self.device)?;
         let position_ids = Tensor::from_vec(batch.position_ids.clone(), shape, &self.device)?;
 
+        println!("[F1 DeBertaModel::forward] Calling embeddings.forward...");
         let embedding_output = self.embeddings.forward(
             &input_ids,
             &type_ids,
             &position_ids,
             Some(&attention_mask_2d),
         )?;
+        println!("[F1 DeBertaModel::forward] After embeddings.forward. Shape: {:?}, Sum: {:?}", embedding_output.shape(), embedding_output.sum_all());
 
+        println!("[F1 DeBertaModel::forward] Calling encoder.forward...");
         let encoder_output = self
             .encoder
             .forward(&embedding_output, &attention_mask_4d)?;
+        println!("[F1 DeBertaModel::forward] After encoder.forward. Shape: {:?}, Sum: {:?}", encoder_output.shape(), encoder_output.sum_all());
 
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
 
         let pooled_embeddings = if has_pooling_requests {
+            println!("[F1 DeBertaModel::forward] Pooling embeddings...");
             self.pool_embeddings(
                 encoder_output.clone(),
                 &batch,
@@ -970,8 +1069,12 @@ impl DeBertaModel {
         } else {
             None
         };
+        if let Some(ref p) = pooled_embeddings {
+             println!("[F1 DeBertaModel::forward] Pooled embeddings shape: {:?}", p.shape());
+        }
 
         let raw_embeddings = if has_raw_requests {
+            println!("[F1 DeBertaModel::forward] Getting raw embeddings...");
             self.get_raw_embeddings(
                 encoder_output,
                 &batch,
@@ -983,7 +1086,11 @@ impl DeBertaModel {
         } else {
             None
         };
+        if let Some(ref r) = raw_embeddings {
+             println!("[F1 DeBertaModel::forward] Raw embeddings shape: {:?}", r.shape());
+        }
 
+        println!("[F1 DeBertaModel::forward] END.");
         Ok((pooled_embeddings, raw_embeddings))
     }
 
