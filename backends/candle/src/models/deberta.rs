@@ -430,7 +430,6 @@ impl DeBertaDisentangledSelfAttention {
         rel_embeddings: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
-        // println!("[F1 disentangled_attention_bias] START. query_layer shape: {:?}, rel_embeddings shape: {:?}", query_layer.shape(), rel_embeddings.shape());
         let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
         let k_len = key_layer.dim(1)?;
         let n_head = self.num_attention_heads;
@@ -445,6 +444,7 @@ impl DeBertaDisentangledSelfAttention {
             self.max_relative_positions
         };
 
+        // Normalize relative_pos dimensions once
         let relative_pos = match relative_pos.dims().len() {
             2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
             3 => relative_pos.unsqueeze(1)?,
@@ -462,63 +462,69 @@ impl DeBertaDisentangledSelfAttention {
             query_layer.dtype(),
             query_layer.device(),
         )?;
-        // println!("[F1 disentangled_attention_bias] Initial score shape: {:?}", score.shape());
 
+        // Improved reshape function that minimizes operations
         let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
-            pos_embedding
+            // Reshape: [2*att_span, hidden] -> [n_head, 2*att_span, d_head]
+            let reshaped = pos_embedding
                 .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)?
-                .contiguous()?
-                .reshape((n_head, 2 * att_span as usize, d_head))?
-                .unsqueeze(0)?
-                .repeat((bs, 1, 1, 1))?
-                .reshape((total_bs_heads, 2 * att_span as usize, d_head))
+                .transpose(0, 1)?;
+            
+            // Only expand if batch_size > 1
+            if bs > 1 {
+                reshaped
+                    .unsqueeze(0)?
+                    .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
+                    .reshape((total_bs_heads, 2 * att_span as usize, d_head))
+            } else {
+                Ok(reshaped.contiguous()?)
+            }
         };
 
         if self.pos_att_type.iter().any(|s| s == "c2p") {
-            // println!("[F1 disentangled_attention_bias] Calculating c2p attention.");
             let pos_key = if self.share_att_key {
                 self.key_proj.forward(&rel_embeddings)?
             } else {
-                match &self.pos_key_proj {
-                    Some(k_proj) => k_proj.forward(&rel_embeddings)?,
-                    None => return Err(candle::Error::Msg("pos_key_proj not found".to_string())),
-                }
+                self.pos_key_proj
+                    .as_ref()
+                    .ok_or_else(|| candle::Error::Msg("pos_key_proj not found".to_string()))?
+                    .forward(&rel_embeddings)?
             };
 
             let pos_key_layer = reshape_pos_embedding(pos_key)?;
-            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
+            
+            // Scale pos_key_layer before matmul for better numerical stability
+            let pos_key_scaled = pos_key_layer.transpose(1, 2)?.broadcast_div(&scale_tensor)?;
+            let c2p_att = query_layer.matmul(&pos_key_scaled)?;
 
+            // Improved position index calculation
             let c2p_pos = relative_pos
                 .broadcast_add(&Tensor::new(&[att_span as i64], relative_pos.device())?)?
-                .clamp(0i64, 2 * att_span - 1)?
-                .to_dtype(DType::U32)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .to_dtype(DType::I64)?;  // Keep as I64 for gather
+
+            // Prepare indices for gather - ensure contiguous
+            let c2p_indices = c2p_pos
+                .squeeze(0)?
+                .squeeze(0)?
+                .expand(&[total_bs_heads, q_len, k_len])?
                 .contiguous()?;
 
-            let c2p_att = c2p_att.gather(
-                &c2p_pos
-                    .squeeze(0)?
-                    .squeeze(0)?
-                    .expand(&[total_bs_heads, q_len, k_len])?
-                    .contiguous()?,
-                D::Minus1, // Changed from 2
-            )?;
-            // println!("[F1 disentangled_attention_bias] c2p_att gathered shape: {:?}, Sum: {:?}", c2p_att.shape(), c2p_att.sum_all());
-            score = score.add(&c2p_att.broadcast_div(&scale_tensor)?)?;
-            // println!("[F1 disentangled_attention_bias] score after c2p. Sum: {:?}", score.sum_all());
+            let c2p_att_gathered = c2p_att.gather(&c2p_indices, 2)?;  // Use dimension 2
+            score = score.add(&c2p_att_gathered)?;
         }
 
         if self.pos_att_type.iter().any(|s| s == "p2c") {
-            // println!("[F1 disentangled_attention_bias] Calculating p2c attention.");
             let pos_query = if self.share_att_key {
                 self.query_proj.forward(&rel_embeddings)?
             } else {
-                match &self.pos_query_proj {
-                    Some(q_proj) => q_proj.forward(&rel_embeddings)?,
-                    None => return Err(candle::Error::Msg("pos_query_proj not found".to_string())),
-                }
+                self.pos_query_proj
+                    .as_ref()
+                    .ok_or_else(|| candle::Error::Msg("pos_query_proj not found".to_string()))?
+                    .forward(&rel_embeddings)?
             };
 
+            // Determine if we need a different relative position
             let r_pos = if key_layer.dim(1)? != query_layer.dim(1)? {
                 build_relative_position(
                     key_layer.dim(1)?,
@@ -531,32 +537,38 @@ impl DeBertaDisentangledSelfAttention {
                 relative_pos.clone()
             };
 
-            let p2c_pos = r_pos
-                .to_dtype(DType::F32)?
-                .neg()?
-                .broadcast_add(&Tensor::new(&[att_span as f32], relative_pos.device())?)?
-                .clamp(0f32, (2 * att_span - 1) as f32)?
-                .to_dtype(DType::U32)?
-                .contiguous()?;
+            // Improved negation handling - avoid unnecessary conversions
+            let neg_r_pos = {
+                // Try integer negation first (more precise)
+                let zero = Tensor::zeros_like(&r_pos)?;
+                zero.broadcast_sub(&r_pos)?
+            };
+            
+            let p2c_pos = neg_r_pos
+                .broadcast_add(&Tensor::new(&[att_span as i64], relative_pos.device())?)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .to_dtype(DType::I64)?;  // Keep as I64 for gather
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
-            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
-            let p2c_att = p2c_att
-                .gather(
-                    &p2c_pos
-                        .squeeze(0)?
-                        .squeeze(0)?
-                        .expand(&[total_bs_heads, k_len, k_len])?
-                        .contiguous()?,
-                    D::Minus1, // Changed from 2
-                )?
+            
+            // Scale before matmul
+            let pos_query_scaled = pos_query_layer.transpose(1, 2)?.broadcast_div(&scale_tensor)?;
+            let p2c_att = key_layer.matmul(&pos_query_scaled)?;
+            
+            // Prepare indices for gather
+            let p2c_indices = p2c_pos
+                .squeeze(0)?
+                .squeeze(0)?
+                .expand(&[total_bs_heads, k_len, k_len])?
+                .contiguous()?;
+            
+            let p2c_att_gathered = p2c_att
+                .gather(&p2c_indices, 2)?  // Use dimension 2
                 .transpose(1, 2)?;
-            // println!("[F1 disentangled_attention_bias] p2c_att gathered&transposed shape: {:?}, Sum: {:?}", p2c_att.shape(), p2c_att.sum_all());
-            score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
-            // println!("[F1 disentangled_attention_bias] score after p2c. Sum: {:?}", score.sum_all());
+            
+            score = score.add(&p2c_att_gathered)?;
         }
 
-        // println!("[F1 disentangled_attention_bias] END. Final score shape: {:?}", score.shape());
         Ok(score)
     }
 }
