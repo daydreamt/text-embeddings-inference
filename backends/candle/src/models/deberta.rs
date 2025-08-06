@@ -155,8 +155,16 @@ impl DeBertaEmbeddings {
         let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
 
         if let Some(mask) = attention_mask {
-            let mask = mask.unsqueeze(D::Minus1)?.expand(embeddings.shape())?;
-            embeddings = embeddings.broadcast_mul(&mask.to_dtype(embeddings.dtype())?)?;
+            // Fixed: Match Candle's mask handling logic
+            let mut mask = mask.clone();
+            if mask.dims() != embeddings.dims() {
+                if mask.dims().len() == 4 {
+                    mask = mask.squeeze(1)?.squeeze(1)?;
+                }
+                mask = mask.unsqueeze(2)?;
+            }
+            mask = mask.to_dtype(embeddings.dtype())?;
+            embeddings = embeddings.broadcast_mul(&mask)?;
         }
 
         Ok(embeddings)
@@ -407,12 +415,6 @@ impl DeBertaDisentangledSelfAttention {
             ),
         };
 
-        let relative_pos = if relative_pos.dim(0)? == 1 {
-            relative_pos.repeat((total_bs_heads, 1, 1, 1))?.squeeze(1)?
-        } else {
-            relative_pos.reshape((total_bs_heads, q_len, k_len))?
-        };
-
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
         let mut score = Tensor::zeros(
@@ -451,7 +453,15 @@ impl DeBertaDisentangledSelfAttention {
                 .to_dtype(DType::U32)?
                 .contiguous()?;
 
-            let c2p_att = c2p_att.gather(&c2p_pos, 2)?;
+            // Fixed: Use D::Minus1 instead of 2
+            let c2p_att = c2p_att.gather(
+                &c2p_pos
+                    .squeeze(0)?
+                    .squeeze(0)?
+                    .expand(&[total_bs_heads, q_len, k_len])?
+                    .contiguous()?,
+                D::Minus1,  // Changed from 2
+            )?;
             score = score.add(&c2p_att.broadcast_div(&scale_tensor)?)?;
         }
 
@@ -476,7 +486,6 @@ impl DeBertaDisentangledSelfAttention {
             } else {
                 relative_pos.clone()
             };
-
             let p2c_pos = r_pos
                 .to_dtype(DType::F32)?
                 .neg()?
@@ -487,12 +496,21 @@ impl DeBertaDisentangledSelfAttention {
 
             let pos_query_layer = reshape_pos_embedding(pos_query)?;
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
-            let p2c_att = p2c_att.gather(&p2c_pos, 2)?.transpose(1, 2)?;
+            // Fixed: Use D::Minus1 instead of 2
+            let p2c_att = p2c_att.gather(
+                &p2c_pos
+                    .squeeze(0)?
+                    .squeeze(0)?
+                    .expand(&[total_bs_heads, k_len, k_len])?
+                    .contiguous()?,
+                D::Minus1,  // Changed from 2
+            )?.transpose(1, 2)?;
             score = score.add(&p2c_att.broadcast_div(&scale_tensor)?)?;
         }
 
         Ok(score)
     }
+
 }
 struct DeBertaAttention {
     self_attention: DeBertaDisentangledSelfAttention,
