@@ -350,10 +350,13 @@ impl DeBertaDisentangledSelfAttention {
         let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
         // println!("[F1 DeBertaDisentangledSelfAttention::forward] scale: {}", scale);
 
+        // Compute raw attention scores
+        let mut attention_scores = query_layer.matmul(&key_layer.transpose(1, 2)?)?;
+
+        // Scale after multiplication (more numerically stable)
         let scale_tensor =
             Tensor::new(&[scale as f32], query_layer.device())?.to_dtype(query_layer.dtype())?;
-        let mut attention_scores =
-            query_layer.matmul(&key_layer.t()?.broadcast_div(&scale_tensor)?)?;
+        attention_scores = attention_scores.broadcast_div(&scale_tensor)?;
         // println!("[F1 DeBertaDisentangledSelfAttention::forward] attention_scores (content). Shape: {:?}, Sum: {:?}", attention_scores.shape(), attention_scores.sum_all());
 
         if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
@@ -399,7 +402,7 @@ impl DeBertaDisentangledSelfAttention {
         if let Ok(ref final_context_tensor) = final_context {
             // println!("[F1 DeBertaDisentangledSelfAttention::forward] END. final_context shape: {:?}", final_context_tensor.shape());
         }
-        
+
         final_context
     }
 
@@ -612,11 +615,12 @@ impl DeBertaAttention {
         let attention_output = self.dense.forward(&self_output)?;
         // println!("[F1 DeBertaAttention::forward] After dense. Shape: {:?}, Sum: {:?}", attention_output.shape(), attention_output.sum_all());
 
-        let result = self.layer_norm
+        let result = self
+            .layer_norm
             .forward(&attention_output, Some(hidden_states));
 
         if let Ok(ref res) = result {
-             // println!("[F1 DeBertaAttention::forward] END. After layer_norm. Shape: {:?}, Sum: {:?}", res.shape(), res.sum_all());
+            // println!("[F1 DeBertaAttention::forward] END. After layer_norm. Shape: {:?}, Sum: {:?}", res.shape(), res.sum_all());
         }
         result
     }
@@ -694,9 +698,10 @@ impl DeBertaLayer {
         let layer_output = self.output.forward(&intermediate_output)?;
         // println!("[F1 DeBertaLayer::forward] After output. Shape: {:?}, Sum: {:?}", layer_output.shape(), layer_output.sum_all());
 
-        let result = self.layer_norm
+        let result = self
+            .layer_norm
             .forward(&layer_output, Some(&attention_output));
-        
+
         if let Ok(ref res) = result {
             // println!("[F1 DeBertaLayer::forward] END. After layer_norm. Shape: {:?}, Sum: {:?}", res.shape(), res.sum_all());
         }
@@ -823,12 +828,12 @@ impl DeBertaEncoder {
 
         let relative_pos = self.get_rel_pos(hidden_states)?;
         if let Some(ref rp) = relative_pos {
-             // println!("[F1 DeBertaEncoder::forward] Got relative_pos. Shape: {:?}", rp.shape());
+            // println!("[F1 DeBertaEncoder::forward] Got relative_pos. Shape: {:?}", rp.shape());
         }
 
         let relative_embeddings = self.get_rel_embedding()?;
         if let Some(ref re) = relative_embeddings {
-             // println!("[F1 DeBertaEncoder::forward] Got relative_embeddings. Shape: {:?}", re.shape());
+            // println!("[F1 DeBertaEncoder::forward] Got relative_embeddings. Shape: {:?}", re.shape());
         }
 
         let mut current_hidden_states = hidden_states.clone();
@@ -1027,7 +1032,7 @@ impl DeBertaModel {
         let attention_mask_2d =
             Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?
                 .to_dtype(self.dtype)?; // Ensure it's in the model's dtype
-        // println!("[F1 DeBertaModel::forward] attention_mask_2d shape: {:?}", attention_mask_2d.shape());
+                                        // println!("[F1 DeBertaModel::forward] attention_mask_2d shape: {:?}", attention_mask_2d.shape());
 
         let attention_mask_4d = self._get_attention_mask(attention_mask_2d.clone())?;
         // println!("[F1 DeBertaModel::forward] attention_mask_4d shape: {:?}", attention_mask_4d.shape());
@@ -1070,7 +1075,7 @@ impl DeBertaModel {
             None
         };
         if let Some(ref p) = pooled_embeddings {
-             // println!("[F1 DeBertaModel::forward] Pooled embeddings shape: {:?}", p.shape());
+            // println!("[F1 DeBertaModel::forward] Pooled embeddings shape: {:?}", p.shape());
         }
 
         let raw_embeddings = if has_raw_requests {
@@ -1087,7 +1092,7 @@ impl DeBertaModel {
             None
         };
         if let Some(ref r) = raw_embeddings {
-             // println!("[F1 DeBertaModel::forward] Raw embeddings shape: {:?}", r.shape());
+            // println!("[F1 DeBertaModel::forward] Raw embeddings shape: {:?}", r.shape());
         }
 
         // println!("[F1 DeBertaModel::forward] END.");
