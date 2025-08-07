@@ -51,7 +51,7 @@ mod qwen3;
 
 pub use bert::{BertConfig, BertModel, PositionEmbeddingType};
 use candle::{Result, Tensor};
-pub use deberta::{DeBertaConfig, DeBertaModel};
+pub use deberta::{DebertaV2Config, DebertaV2Model};
 pub use dense::{Dense, DenseConfig, DenseLayer};
 pub use distilbert::{DistilBertConfig, DistilBertModel};
 #[allow(unused_imports)]

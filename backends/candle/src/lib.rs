@@ -11,7 +11,7 @@ use crate::compute_cap::{
     compatible_compute_cap, get_compile_compute_cap, get_runtime_compute_cap,
 };
 use crate::models::{
-    BertConfig, BertModel, DeBertaConfig, DeBertaModel, Dense, DenseConfig, DenseLayer,
+    BertConfig, BertModel, DebertaV2Config, DebertaV2Model, Dense, DenseConfig, DenseLayer,
     DistilBertConfig, DistilBertModel, GTEConfig, GTEModel, JinaBertModel, JinaCodeBertModel,
     MPNetConfig, MPNetModel, MistralConfig, Model, ModernBertConfig, ModernBertModel,
     NomicBertModel, NomicConfig, Qwen2Config, Qwen3Config, Qwen3Model,
@@ -95,7 +95,7 @@ enum Config {
     Camembert(BertConfig),
     Roberta(BertConfig),
     #[serde(rename = "deberta-v2")]
-    DeBerta(DeBertaConfig),
+    DebertaV2(DebertaV2Config),
     #[serde(rename(deserialize = "distilbert"))]
     DistilBert(DistilBertConfig),
     #[serde(rename(deserialize = "nomic_bert"))]
@@ -249,9 +249,13 @@ impl CandleBackend {
                     Ok(Box::new(BertModel::load(vb, &config, model_type).s()?))
                 }
             },
-            (Config::DeBerta(config), Device::Cpu | Device::Metal(_)) => {
-                tracing::info!("Starting DeBERTa model on {:?}", device);
-                Ok(Box::new(DeBertaModel::load(vb, &config, model_type).s()?))
+            (Config::DebertaV2(config), Device::Cpu | Device::Metal(_)) => {
+                tracing::info!(
+                    "Starting DeBERTa-V2 model on {:?} with dtype {:?}",
+                    device,
+                    dtype
+                );
+                Ok(Box::new(DebertaV2Model::load(vb, &config, model_type).s()?))
             }
             (
                 Config::XlmRoberta(config) | Config::Camembert(config) | Config::Roberta(config),
