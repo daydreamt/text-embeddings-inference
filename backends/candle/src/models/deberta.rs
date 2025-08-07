@@ -933,37 +933,47 @@ impl DebertaV2Model {
 
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let _enter = self.span.enter();
-        let batch_len = batch.len();
+
+        let batch_size = batch.len();
         let max_length = batch.max_length as usize;
+        let elems = batch_size * max_length;
 
-        let mut input_lengths = Vec::with_capacity(batch_len);
-        for i in 0..batch_len {
-            let length =
-                (batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i]) as usize;
-            input_lengths.push(length);
+        let mut input_ids = Vec::with_capacity(elems);
+        let mut type_ids = Vec::with_capacity(elems);
+        let mut position_ids = Vec::with_capacity(elems);
+        let mut attention_mask = Vec::with_capacity(elems);
+        let mut input_lengths = Vec::with_capacity(batch_size);
+        let mut masking = false;
+
+        for i in 0..batch_size {
+            let start = batch.cumulative_seq_lengths[i] as usize;
+            let end = batch.cumulative_seq_lengths[i + 1] as usize;
+            let seq_len = end - start;
+            input_lengths.push(seq_len as f32);
+
+            input_ids.extend_from_slice(&batch.input_ids[start..end]);
+            type_ids.extend_from_slice(&batch.token_type_ids[start..end]);
+            position_ids.extend_from_slice(&batch.position_ids[start..end]);
+            attention_mask.extend(std::iter::repeat(1.0f32).take(seq_len));
+
+            let pad = max_length - seq_len;
+            if pad > 0 {
+                masking = true;
+                input_ids.extend(std::iter::repeat(0).take(pad));
+                type_ids.extend(std::iter::repeat(0).take(pad));
+                position_ids.extend(std::iter::repeat(0).take(pad));
+                attention_mask.extend(std::iter::repeat(0.0f32).take(pad));
+            }
         }
 
-        let mut attention_mask_vec = Vec::with_capacity(batch_len * max_length);
-        for &seq_len in &input_lengths {
-            // Use 1.0f32 for valid tokens
-            attention_mask_vec.extend(std::iter::repeat(1.0f32).take(seq_len));
-            // Use 0.0f32 for padding
-            attention_mask_vec.extend(std::iter::repeat(0.0f32).take(max_length - seq_len));
-        }
+        let shape = (batch_size, max_length);
+        let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
+        let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
+        let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
         let attention_mask_2d =
-            Tensor::from_vec(attention_mask_vec, (batch_len, max_length), &self.device)?
-                .to_dtype(self.dtype)?; // Ensure it's in the model's dtype
+            Tensor::from_vec(attention_mask, shape, &self.device)?.to_dtype(self.dtype)?;
 
         let attention_mask_4d = self._get_attention_mask(attention_mask_2d.clone())?;
-
-        // The pooling logic downstream requires f32 lengths.
-        let input_lengths_f32: Vec<f32> = input_lengths.iter().map(|&l| l as f32).collect();
-
-        let shape = (batch_len, max_length);
-        let input_ids = Tensor::from_vec(batch.input_ids.clone(), shape, &self.device)?;
-        let type_ids = Tensor::from_vec(batch.token_type_ids.clone(), shape, &self.device)?;
-        let position_ids = Tensor::from_vec(batch.position_ids.clone(), shape, &self.device)?;
-
         let embedding_output = self.embeddings.forward(
             &input_ids,
             &type_ids,
@@ -982,7 +992,7 @@ impl DebertaV2Model {
             self.pool_embeddings(
                 encoder_output.clone(),
                 &batch,
-                &input_lengths_f32,
+                &input_lengths,
                 has_raw_requests,
             )?
         } else {
@@ -993,8 +1003,8 @@ impl DebertaV2Model {
             self.get_raw_embeddings(
                 encoder_output,
                 &batch,
-                &input_lengths_f32,
-                batch_len,
+                &input_lengths,
+                batch_size,
                 max_length,
                 has_pooling_requests,
             )?
