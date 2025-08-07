@@ -171,32 +171,6 @@ impl DebertaV2Embeddings {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/DebertaV2_v2/modeling_DebertaV2_v2.py#L72
-struct XSoftmax {}
-
-impl XSoftmax {
-    fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
-        let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
-
-        rmask = rmask
-            .broadcast_lt(&Tensor::new(&[1.0_f32], device)?)?
-            .to_dtype(DType::U8)?;
-
-        let min_value_tensor = Tensor::new(&[f32::MIN], device)?
-            .to_dtype(input.dtype())?
-            .broadcast_as(input.shape())?;
-        let mut output = rmask.where_cond(&min_value_tensor, input)?;
-
-        output = candle_nn::ops::softmax(&output, dim)?;
-
-        let t_zeroes = Tensor::new(&[0f32], device)?
-            .to_dtype(output.dtype())?
-            .broadcast_as(output.shape())?;
-        output = rmask.where_cond(&t_zeroes, &output)?;
-        Ok(output)
-    }
-}
-
 struct DebertaV2DisentangledSelfAttention {
     query_proj: Linear,
     key_proj: Linear,
@@ -341,14 +315,13 @@ impl DebertaV2DisentangledSelfAttention {
         let attention_scores =
             attention_scores.reshape((batch_size, self.num_attention_heads, seq_len, seq_len))?;
 
-        let attention_probs =
-            XSoftmax::apply(&attention_scores, attention_mask, D::Minus1, &self.device)?;
+        let attention_logits = attention_scores.broadcast_add(attention_mask)?; // broadcast on head-dim
+        let attention_probs = candle_nn::ops::softmax_last_dim(&attention_logits)?;
 
         let attention_probs =
             attention_probs.reshape((batch_size * self.num_attention_heads, seq_len, seq_len))?;
 
         let context_layer = attention_probs.matmul(&value_layer)?;
-
         let final_context = context_layer
             .reshape((
                 batch_size,
@@ -1015,21 +988,31 @@ impl DebertaV2Model {
         Ok((pooled_embeddings, raw_embeddings))
     }
 
-    fn _get_attention_mask(&self, mut attention_mask: Tensor) -> Result<Tensor> {
-        match attention_mask.dims().len() {
+    fn _get_attention_mask(&self, mut mask: Tensor) -> Result<Tensor> {
+        // give the mask shape (B, 1, L, L)
+        match mask.dims().len() {
             2 => {
-                let extended_attention_mask = attention_mask.unsqueeze(1)?.unsqueeze(2)?;
-                attention_mask = extended_attention_mask.broadcast_mul(
-                    &extended_attention_mask
-                        .squeeze(D::Minus2)?
-                        .unsqueeze(D::Minus1)?,
-                )?;
+                let m = mask.unsqueeze(1)?.unsqueeze(2)?;
+                mask = m.broadcast_mul(&m.squeeze(D::Minus2)?.unsqueeze(D::Minus1)?)?;
             }
-            3 => attention_mask = attention_mask.unsqueeze(1)?,
-            4 => {}
-            len => bail!("Unsupported attention mask dimensions: {len}"),
+            3 => {
+                // (B,L,L) → (B,1,L,L)
+                mask = mask.unsqueeze(1)?;
+            }
+            4 => {} // already (B,?,L,L)
+            n => bail!("unsupported attention-mask rank {n}"),
         }
-        attention_mask.to_dtype(self.dtype)
+
+        let mask = mask.to_dtype(self.dtype)?;
+        let min = match self.dtype {
+            DType::F32 => f32::MIN,
+            _ => -65504.0, // f16 lowest finite value
+        };
+
+        let ones = Tensor::ones_like(&mask)?;
+        let inv = (&ones - &mask)?;
+        let neginf = Tensor::new(&[min], mask.device())?.to_dtype(mask.dtype())?;
+        inv.broadcast_mul(&neginf)
     }
 
     fn pool_embeddings(
