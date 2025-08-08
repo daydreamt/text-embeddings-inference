@@ -25,8 +25,6 @@ pub struct DebertaV2Config {
     pub use_cache: Option<bool>,
     pub classifier_dropout: Option<f64>,
     pub id2label: Option<HashMap<String, String>>,
-    pub label2id: Option<HashMap<String, u32>>,
-    // DebertaV2 specific configurations
     pub relative_attention: bool,
     pub pos_att_type: Option<Vec<String>>,
     pub max_relative_positions: Option<i64>,
@@ -184,7 +182,6 @@ struct DebertaV2DisentangledSelfAttention {
     num_attention_heads: usize,
     attention_head_size: usize,
     all_head_size: usize,
-    pos_dropout: f64,
     span: tracing::Span,
     device: Device,
 }
@@ -262,7 +259,6 @@ impl DebertaV2DisentangledSelfAttention {
             num_attention_heads: config.num_attention_heads,
             attention_head_size,
             all_head_size,
-            pos_dropout: config.hidden_dropout_prob,
             span: tracing::span!(tracing::Level::TRACE, "disentangled_self_attention"),
             device: vb.device().clone(),
         })
@@ -271,69 +267,51 @@ impl DebertaV2DisentangledSelfAttention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: &Tensor,
+        attn_mask: Option<&Tensor>, // (B,1,1,L) or None
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (batch_size, seq_len, _) = hidden_states.dims3()?;
+        let (b, l, _) = hidden_states.dims3()?;
 
-        let q_proj = self.query_proj.forward(hidden_states)?;
-        let query_layer = self.transpose_for_scores(q_proj, batch_size, seq_len)?;
+        let q = self.transpose_for_scores(self.query_proj.forward(hidden_states)?, b, l)?;
+        let k = self.transpose_for_scores(self.key_proj.forward(hidden_states)?, b, l)?;
+        let v = self.transpose_for_scores(self.value_proj.forward(hidden_states)?, b, l)?;
 
-        let k_proj = self.key_proj.forward(hidden_states)?;
-        let key_layer = self.transpose_for_scores(k_proj, batch_size, seq_len)?;
+        let mut attn = q.matmul(&k.transpose(1, 2)?)?;
+        let scale = (self.attention_head_size as f64
+            * (1.0
+                + if self.pos_att_type.iter().any(|s| s == "c2p") {
+                    1.0
+                } else {
+                    0.0
+                }
+                + if self.pos_att_type.iter().any(|s| s == "p2c") {
+                    1.0
+                } else {
+                    0.0
+                }))
+        .sqrt();
+        attn = (attn * (1.0f64 / scale))?;
 
-        let v_proj = self.value_proj.forward(hidden_states)?;
-        let value_layer = self.transpose_for_scores(v_proj, batch_size, seq_len)?;
-
-        let mut scale_factor = 1.0;
-        if self.pos_att_type.iter().any(|s| s == "c2p") {
-            scale_factor += 1.0;
-        }
-        if self.pos_att_type.iter().any(|s| s == "p2c") {
-            scale_factor += 1.0;
-        }
-        let scale = (self.attention_head_size as f64 * scale_factor).sqrt();
-
-        let scale_tensor =
-            Tensor::new(&[scale as f32], query_layer.device())?.to_dtype(query_layer.dtype())?;
-        let mut attention_scores = query_layer.matmul(&key_layer.transpose(1, 2)?)?;
-
-        attention_scores = attention_scores.broadcast_div(&scale_tensor)?;
-        if let (Some(rel_embeddings), Some(relative_pos)) = (relative_embeddings, relative_pos) {
-            let rel_att = self.disentangled_attention_bias(
-                &query_layer,
-                &key_layer,
-                relative_pos,
-                rel_embeddings,
-                scale,
-            )?;
-            attention_scores = attention_scores.add(&rel_att)?;
+        if let (Some(rel_e), Some(rel_p)) = (relative_embeddings, relative_pos) {
+            attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, scale)?)?;
         }
 
-        let attention_scores =
-            attention_scores.reshape((batch_size, self.num_attention_heads, seq_len, seq_len))?;
+        let attn = attn.reshape((b, self.num_attention_heads, l, l))?;
+        let attn = if let Some(mask) = attn_mask {
+            attn.broadcast_add(mask)? // (B,H,L,L) + (B,1,1,L)
+        } else {
+            attn
+        };
 
-        let attention_logits = attention_scores.broadcast_add(attention_mask)?; // broadcast on head-dim
-        let attention_probs = candle_nn::ops::softmax_last_dim(&attention_logits)?;
-
-        let attention_probs =
-            attention_probs.reshape((batch_size * self.num_attention_heads, seq_len, seq_len))?;
-
-        let context_layer = attention_probs.matmul(&value_layer)?;
-        let final_context = context_layer
-            .reshape((
-                batch_size,
-                self.num_attention_heads,
-                seq_len,
-                self.attention_head_size,
-            ))?
+        let probs = candle_nn::ops::softmax_last_dim(&attn)?;
+        let probs = probs.reshape((b * self.num_attention_heads, l, l))?;
+        let ctx = probs.matmul(&v)?;
+        ctx.reshape((b, self.num_attention_heads, l, self.attention_head_size))?
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((batch_size, seq_len, self.all_head_size));
-
-        final_context
+            .reshape((b, l, self.all_head_size))
     }
 
     fn transpose_for_scores(&self, x: Tensor, batch_size: usize, seq_len: usize) -> Result<Tensor> {
@@ -526,26 +504,19 @@ impl DebertaV2Attention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: &Tensor,
+        attn_mask: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-
-        let self_output = self.self_attention.forward(
+        let self_out = self.self_attention.forward(
             hidden_states,
-            attention_mask,
+            attn_mask,
             relative_embeddings,
             relative_pos,
         )?;
-
-        let attention_output = self.dense.forward(&self_output)?;
-
-        let result = self
-            .layer_norm
-            .forward(&attention_output, Some(hidden_states));
-
-        result
+        let y = self.dense.forward(&self_out)?;
+        self.layer_norm.forward(&y, Some(hidden_states))
     }
 }
 
@@ -598,28 +569,16 @@ impl DebertaV2Layer {
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: &Tensor,
+        attn_mask: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-
-        let attention_output = self.attention.forward(
-            hidden_states,
-            attention_mask,
-            relative_embeddings,
-            relative_pos,
-        )?;
-
-        let intermediate_output = self.intermediate.forward(&attention_output)?;
-
-        let layer_output = self.output.forward(&intermediate_output)?;
-
-        let result = self
-            .layer_norm
-            .forward(&layer_output, Some(&attention_output));
-
-        result
+        let x =
+            self.attention
+                .forward(hidden_states, attn_mask, relative_embeddings, relative_pos)?;
+        let h = self.intermediate.forward(&x)?;
+        self.layer_norm.forward(&self.output.forward(&h)?, Some(&x))
     }
 }
 
@@ -736,17 +695,16 @@ impl DebertaV2Encoder {
         }
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attn_mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
         let relative_pos = self.get_rel_pos(hidden_states)?;
-
         let relative_embeddings = self.get_rel_embedding()?;
 
         let mut current_hidden_states = hidden_states.clone();
-        for (i, layer) in self.layers.iter().enumerate() {
+        for layer in &self.layers {
             current_hidden_states = layer.forward(
                 &current_hidden_states,
-                attention_mask,
+                attn_mask,
                 relative_embeddings.as_ref(),
                 relative_pos.as_ref(),
             )?;
@@ -904,6 +862,27 @@ impl DebertaV2Model {
         })
     }
 
+    #[inline]
+    fn make_additive_key_padding_mask(&self, mask_2d: &Tensor) -> candle::Result<Tensor> {
+        // mask_2d: (B, L) with 1 for real tokens, 0 for pads
+        let key_mask = mask_2d
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)? // (B, 1, L)
+            .unsqueeze(1)?; // (B, 1, 1, L)
+
+        // inv = 1 - key_mask, but make "1" the same shape to avoid scalar-broadcast issues
+        let ones = Tensor::ones_like(&key_mask)?; // (B,1,1,L)
+        let inv = (&ones - &key_mask)?; // (B,1,1,L)
+
+        // convert inv ∈ {0,1} to {0,-INF}
+        let neg_inf = match self.dtype {
+            DType::F32 => -1.0e9f32,
+            _ => -65504.0f32, // lowest finite f16
+        };
+        let neg = Tensor::from_slice(&[neg_inf], (1,), &self.device)?.to_dtype(self.dtype)?;
+        inv.broadcast_mul(&neg) // (B,1,1,L)
+    }
+
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let _enter = self.span.enter();
 
@@ -943,20 +922,30 @@ impl DebertaV2Model {
         let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
         let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
         let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
-        let attention_mask_2d =
-            Tensor::from_vec(attention_mask, shape, &self.device)?.to_dtype(self.dtype)?;
+        let attention_mask_2d: Option<Tensor> = if masking {
+            Some(
+                Tensor::from_vec(attention_mask, (batch_size, max_length), &self.device)?
+                    .to_dtype(self.dtype)?,
+            )
+        } else {
+            None
+        };
 
-        let attention_mask_4d = self._get_attention_mask(attention_mask_2d.clone())?;
         let embedding_output = self.embeddings.forward(
             &input_ids,
             &type_ids,
             &position_ids,
-            Some(&attention_mask_2d),
+            attention_mask_2d.as_ref(),
         )?;
+
+        let attention_add_mask: Option<Tensor> = match &attention_mask_2d {
+            Some(m) => Some(self.make_additive_key_padding_mask(m)?),
+            None => None,
+        };
 
         let encoder_output = self
             .encoder
-            .forward(&embedding_output, &attention_mask_4d)?;
+            .forward(&embedding_output, attention_add_mask.as_ref())?;
 
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
@@ -986,33 +975,6 @@ impl DebertaV2Model {
         };
 
         Ok((pooled_embeddings, raw_embeddings))
-    }
-
-    fn _get_attention_mask(&self, mut mask: Tensor) -> Result<Tensor> {
-        // give the mask shape (B, 1, L, L)
-        match mask.dims().len() {
-            2 => {
-                let m = mask.unsqueeze(1)?.unsqueeze(2)?;
-                mask = m.broadcast_mul(&m.squeeze(D::Minus2)?.unsqueeze(D::Minus1)?)?;
-            }
-            3 => {
-                // (B,L,L) → (B,1,L,L)
-                mask = mask.unsqueeze(1)?;
-            }
-            4 => {} // already (B,?,L,L)
-            n => bail!("unsupported attention-mask rank {n}"),
-        }
-
-        let mask = mask.to_dtype(self.dtype)?;
-        let min = match self.dtype {
-            DType::F32 => f32::MIN,
-            _ => -65504.0, // f16 lowest finite value
-        };
-
-        let ones = Tensor::ones_like(&mask)?;
-        let inv = (&ones - &mask)?;
-        let neginf = Tensor::new(&[min], mask.device())?.to_dtype(mask.dtype())?;
-        inv.broadcast_mul(&neginf)
     }
 
     fn pool_embeddings(
