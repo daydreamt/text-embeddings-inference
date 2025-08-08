@@ -327,6 +327,7 @@ impl DebertaV2DisentangledSelfAttention {
             transposed.dim(3)?, // This should be attention_head_size
         ))
     }
+
     fn disentangled_attention_bias(
         &self,
         query_layer: &Tensor,
@@ -349,7 +350,7 @@ impl DebertaV2DisentangledSelfAttention {
             self.max_relative_positions
         };
 
-        // Normalize relative_pos dimensions once
+        // Normalize relative_pos dims without allocating a large buffer.
         let relative_pos = match relative_pos.dims().len() {
             2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
             3 => relative_pos.unsqueeze(1)?,
@@ -362,29 +363,27 @@ impl DebertaV2DisentangledSelfAttention {
 
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        let mut score = Tensor::zeros(
-            (total_bs_heads, q_len, k_len),
-            query_layer.dtype(),
-            query_layer.device(),
-        )?;
+        // Lazily accumulate bias terms to avoid a full (B*H, L, L) zero allocation.
+        let mut score: Option<Tensor> = None;
 
+        // Reshape: [2*att_span, hidden] -> [B*H, 2*att_span, d_head] (expand only when bs>1)
         let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
-            // Reshape: [2*att_span, hidden] -> [n_head, 2*att_span, d_head]
             let reshaped = pos_embedding
                 .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)?;
+                .transpose(0, 1)?; // (H, 2*span, d)
 
-            // Only expand if batch_size > 1
             if bs > 1 {
                 reshaped
                     .unsqueeze(0)?
                     .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
                     .reshape((total_bs_heads, 2 * att_span as usize, d_head))
             } else {
-                Ok(reshaped.contiguous()?)
+                // H == total_bs_heads when bs == 1
+                reshaped.reshape((total_bs_heads, 2 * att_span as usize, d_head))
             }
         };
 
+        // ---- c2p term -------------------------------------------------------
         if self.use_c2p_att {
             let pos_key = if self.share_att_key {
                 self.key_proj.forward(&rel_embeddings)?
@@ -395,8 +394,9 @@ impl DebertaV2DisentangledSelfAttention {
                     .forward(&rel_embeddings)?
             };
 
-            let pos_key_layer = reshape_pos_embedding(pos_key)?;
-            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
+            let pos_key_layer = reshape_pos_embedding(pos_key)?; // (B*H, 2*span, d)
+            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?; // (B*H, Lq, 2*span)
+
             let c2p_pos = relative_pos
                 .broadcast_add(&Tensor::new(&[att_span as i64], relative_pos.device())?)?
                 .clamp(0i64, (2 * att_span - 1) as i64)?
@@ -406,13 +406,18 @@ impl DebertaV2DisentangledSelfAttention {
                 .squeeze(0)?
                 .squeeze(0)?
                 .expand(&[total_bs_heads, q_len, k_len])?
-                .contiguous()?;
+                .contiguous()?; // gather needs a dense index view
 
-            let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
-            let c2p_att_scaled = c2p_att_gathered.broadcast_div(&scale_tensor)?;
-            score = score.add(&c2p_att_scaled)?;
+            let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?; // (B*H, Lq, Lk)
+            let c2p_scaled = c2p_att_gathered.broadcast_div(&scale_tensor)?;
+
+            score = Some(match score {
+                Some(s) => s.add(&c2p_scaled)?,
+                None => c2p_scaled,
+            });
         }
 
+        // ---- p2c term -------------------------------------------------------
         if self.use_p2c_att {
             let pos_query = if self.share_att_key {
                 self.query_proj.forward(&rel_embeddings)?
@@ -423,6 +428,7 @@ impl DebertaV2DisentangledSelfAttention {
                     .forward(&rel_embeddings)?
             };
 
+            // If key and query lengths differ, rebuild r_pos; otherwise reuse.
             let r_pos = if key_layer.dim(1)? != query_layer.dim(1)? {
                 build_relative_position(
                     key_layer.dim(1)?,
@@ -431,22 +437,22 @@ impl DebertaV2DisentangledSelfAttention {
                     Some(self.position_buckets as isize),
                     Some(self.max_relative_positions as isize),
                 )?
+                .unsqueeze(0)?
+                .unsqueeze(0)?
             } else {
                 relative_pos.clone()
             };
 
-            let neg_r_pos = {
-                let zero = Tensor::zeros_like(&r_pos)?;
-                zero.broadcast_sub(&r_pos)?
-            };
+            // Avoid allocating a zeros-like tensor; negate in-place type domain.
+            let p2c_pos = r_pos
+                .to_dtype(DType::F32)?
+                .neg()? // -r_pos
+                .broadcast_add(&Tensor::new(&[att_span as f32], r_pos.device())?)?
+                .clamp(0f32, (2 * att_span - 1) as f32)?
+                .to_dtype(DType::I64)?; // indices for gather
 
-            let p2c_pos = neg_r_pos
-                .broadcast_add(&Tensor::new(&[att_span as i64], relative_pos.device())?)?
-                .clamp(0i64, (2 * att_span - 1) as i64)?
-                .to_dtype(DType::I64)?; // Keep as I64 for gather
-
-            let pos_query_layer = reshape_pos_embedding(pos_query)?;
-            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
+            let pos_query_layer = reshape_pos_embedding(pos_query)?; // (B*H, 2*span, d)
+            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?; // (B*H, Lk, 2*span)
 
             let p2c_indices = p2c_pos
                 .squeeze(0)?
@@ -455,12 +461,22 @@ impl DebertaV2DisentangledSelfAttention {
                 .contiguous()?;
 
             let p2c_att_gathered = p2c_att
-                .gather(&p2c_indices, 2)? // or D::Minus1
-                .transpose(1, 2)?;
-            score = score.add(&p2c_att_gathered.broadcast_div(&scale_tensor)?)?;
+                .gather(&p2c_indices, 2)? // (B*H, Lk, Lk)
+                .transpose(1, 2)?; // -> (B*H, Lq, Lk)
+
+            let p2c_scaled = p2c_att_gathered.broadcast_div(&scale_tensor)?;
+
+            score = Some(match score {
+                Some(s) => s.add(&p2c_scaled)?,
+                None => p2c_scaled,
+            });
         }
 
-        Ok(score)
+        // If neither term is active, return a scalar 0 (broadcasts on add).
+        Ok(match score {
+            Some(s) => s,
+            None => Tensor::new(0f32, query_layer.device())?.to_dtype(query_layer.dtype())?,
+        })
     }
 }
 struct DebertaV2Attention {
@@ -620,8 +636,8 @@ struct DebertaV2Encoder {
     relative_attention: bool,
     position_buckets: i64,
     max_relative_positions: i64,
-    rel_pos_full: Option<Tensor>,           // (1, Lmax, Lmax), I64
-    rel_embeddings_cached: Option<Tensor>,  // (2*att_span, hidden), dtype of params
+    rel_pos_full: Option<Tensor>,          // (1, Lmax, Lmax), I64
+    rel_embeddings_cached: Option<Tensor>, // (2*att_span, hidden), dtype of params
     span: tracing::Span,
 }
 
@@ -658,20 +674,26 @@ impl DebertaV2Encoder {
         let rel_pos_full = if config.relative_attention {
             let lmax = config.max_position_embeddings; // sequence length cap
             Some(build_relative_position(
-                lmax, lmax,
+                lmax,
+                lmax,
                 vb.device(),
                 Some(position_buckets as isize),
                 Some(max_relative_positions as isize),
             )?)
-        } else { None };
+        } else {
+            None
+        };
 
         // Cache normalized rel-embeddings once
         let rel_embeddings_cached = if let Some(rel_attn_layer) = &relative_attention_layer {
             let mut e = rel_attn_layer.get_rel_embedding()?;
-            if let Some(ln) = &layer_norm { e = ln.forward(&e, None)?; }
+            if let Some(ln) = &layer_norm {
+                e = ln.forward(&e, None)?;
+            }
             Some(e)
-        } else { None };
-
+        } else {
+            None
+        };
 
         Ok(Self {
             layers,
@@ -688,10 +710,14 @@ impl DebertaV2Encoder {
 
     #[inline]
     fn get_rel_pos(&self, hidden_states: &Tensor) -> Result<Option<Tensor>> {
-        if !self.relative_attention { return Ok(None); }
+        if !self.relative_attention {
+            return Ok(None);
+        }
         let l = hidden_states.dim(1)?;
-        let rp = self.rel_pos_full
-            .as_ref().expect("rel_pos_full missing")
+        let rp = self
+            .rel_pos_full
+            .as_ref()
+            .expect("rel_pos_full missing")
             .narrow(1, 0, l)?
             .narrow(2, 0, l)?;
         Ok(Some(rp))
@@ -701,7 +727,6 @@ impl DebertaV2Encoder {
     fn get_rel_embedding(&self) -> Result<Option<Tensor>> {
         Ok(self.rel_embeddings_cached.clone())
     }
-
 
     fn forward(&self, hidden_states: &Tensor, attn_mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
@@ -727,7 +752,6 @@ impl DebertaV2Encoder {
             None => bail!("DebertaV2Encoder has no layers"),
         }
     }
-
 }
 
 pub struct DebertaV2Pooler {
