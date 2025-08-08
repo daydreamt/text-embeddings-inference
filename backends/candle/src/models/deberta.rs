@@ -620,6 +620,8 @@ struct DebertaV2Encoder {
     relative_attention: bool,
     position_buckets: i64,
     max_relative_positions: i64,
+    rel_pos_full: Option<Tensor>,           // (1, Lmax, Lmax), I64
+    rel_embeddings_cached: Option<Tensor>,  // (2*att_span, hidden), dtype of params
     span: tracing::Span,
 }
 
@@ -653,6 +655,24 @@ impl DebertaV2Encoder {
             max_relative_positions = config.max_position_embeddings as i64;
         }
 
+        let rel_pos_full = if config.relative_attention {
+            let lmax = config.max_position_embeddings; // sequence length cap
+            Some(build_relative_position(
+                lmax, lmax,
+                vb.device(),
+                Some(position_buckets as isize),
+                Some(max_relative_positions as isize),
+            )?)
+        } else { None };
+
+        // Cache normalized rel-embeddings once
+        let rel_embeddings_cached = if let Some(rel_attn_layer) = &relative_attention_layer {
+            let mut e = rel_attn_layer.get_rel_embedding()?;
+            if let Some(ln) = &layer_norm { e = ln.forward(&e, None)?; }
+            Some(e)
+        } else { None };
+
+
         Ok(Self {
             layers,
             relative_attention_layer,
@@ -660,36 +680,28 @@ impl DebertaV2Encoder {
             relative_attention: config.relative_attention,
             position_buckets,
             max_relative_positions,
+            rel_pos_full,
+            rel_embeddings_cached,
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
 
+    #[inline]
     fn get_rel_pos(&self, hidden_states: &Tensor) -> Result<Option<Tensor>> {
-        if !self.relative_attention {
-            return Ok(None);
-        }
-        let (q_len, k_len) = (hidden_states.dim(1)?, hidden_states.dim(1)?);
-        let rel_pos = build_relative_position(
-            q_len,
-            k_len,
-            hidden_states.device(),
-            Some(self.position_buckets as isize),
-            Some(self.max_relative_positions as isize),
-        )?;
-        Ok(Some(rel_pos))
+        if !self.relative_attention { return Ok(None); }
+        let l = hidden_states.dim(1)?;
+        let rp = self.rel_pos_full
+            .as_ref().expect("rel_pos_full missing")
+            .narrow(1, 0, l)?
+            .narrow(2, 0, l)?;
+        Ok(Some(rp))
     }
 
+    #[inline]
     fn get_rel_embedding(&self) -> Result<Option<Tensor>> {
-        if let Some(rel_attn_layer) = &self.relative_attention_layer {
-            let mut embeddings = rel_attn_layer.get_rel_embedding()?;
-            if let Some(ln) = &self.layer_norm {
-                embeddings = ln.forward(&embeddings, None)?;
-            }
-            Ok(Some(embeddings))
-        } else {
-            Ok(None)
-        }
+        Ok(self.rel_embeddings_cached.clone())
     }
+
 
     fn forward(&self, hidden_states: &Tensor, attn_mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
