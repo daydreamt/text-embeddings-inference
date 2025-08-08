@@ -294,47 +294,46 @@ impl DebertaV2DisentangledSelfAttention {
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
         let (b, l, _) = hidden_states.dims3()?;
 
+        // Q, K, V: (B*H, L, d_head)
         let q = self.transpose_for_scores(self.query_proj.forward(hidden_states)?, b, l)?;
         let k = self.transpose_for_scores(self.key_proj.forward(hidden_states)?, b, l)?;
         let v = self.transpose_for_scores(self.value_proj.forward(hidden_states)?, b, l)?;
 
-        let mut attn = q.matmul(&k.transpose(1, 2)?)?;
+        // Content scores
+        let mut attn = q.matmul(&k.transpose(1, 2)?)?; // (B*H, L, L)
+
+        // Scale (accounts for c2p/p2c as in your code)
         let scale = (self.attention_head_size as f64
             * (1.0
                 + if self.use_c2p_att { 1.0 } else { 0.0 }
                 + if self.use_p2c_att { 1.0 } else { 0.0 }))
-        .sqrt();
+            .sqrt();
         attn = (attn * (1.0f64 / scale))?;
 
+        // Add relative bias if any
         if let (Some(rel_e), Some(rel_p)) = (relative_embeddings, relative_pos) {
             attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, scale)?)?;
         }
 
-        // attn: (B*H, L, L)
-        let attn = if let Some(mask) = attn_mask {
-            // mask: (B,1,1,L) → (B,H,1,L) → (B*H,1,L) with the SAME (B,H) ordering as attn
-            let m = mask
-                .squeeze(1)?                // (B,1,L)
-                .squeeze(1)?                // (B,L)
-                .unsqueeze(1)?              // (B,1,L)
-                .unsqueeze(1)?              // (B,1,1,L)
-                .expand(&[b, self.num_attention_heads, 1, l])? // (B,H,1,L) view
-                .contiguous()?              // materialize; keeps MPS happy
-                .reshape((b * self.num_attention_heads, 1, l))?; // (B*H,1,L)
-
-            attn.broadcast_add(&m)?
+        // ---- Additive mask in 4D, softmax, back to 3D ----
+        // attn4: (B, H, L, L), mask: (B,1,1,L)
+        let probs = if let Some(mask) = attn_mask {
+            let attn4 = attn
+                .reshape((b, self.num_attention_heads, l, l))?;
+            let attn4 = attn4.broadcast_add(mask)?; // (B,H,L,L)
+            let probs4 = candle_nn::ops::softmax_last_dim(&attn4)?; // (B,H,L,L)
+            probs4.reshape((b * self.num_attention_heads, l, l))? // (B*H,L,L)
         } else {
-            attn
+            candle_nn::ops::softmax(&attn, D::Minus1)? // (B*H,L,L)
         };
 
-        let probs = candle_nn::ops::softmax(&attn, D::Minus1)?;
-        let ctx = probs.matmul(&v)?;
+        // Context
+        let ctx = probs.matmul(&v)?; // (B*H, L, d_head)
         ctx.reshape((b, self.num_attention_heads, l, self.attention_head_size))?
-            .transpose(1, 2)?
-            .contiguous()?
+            .transpose(1, 2)?   // (B, L, H, d_head)
+            .contiguous()?      // keep Metal/MPS happy
             .reshape((b, l, self.all_head_size))
     }
 
@@ -887,6 +886,7 @@ pub struct DebertaV2Model {
     device: Device,
     dtype: DType,
     span: tracing::Span,
+    neg_mask_value: Tensor,
 }
 
 impl DebertaV2Model {
@@ -918,6 +918,11 @@ impl DebertaV2Model {
 
         let embeddings = DebertaV2Embeddings::load(vb.pp("deberta.embeddings"), config)?;
         let encoder = DebertaV2Encoder::load(vb.pp("deberta.encoder"), config)?;
+        let neg_val = match vb.dtype() {
+            DType::F32 => -1.0e9f32,
+            _          => -65504.0f32, // f16 lowest finite; -1e4 also works
+        };
+        let neg_mask_value = Tensor::from_slice(&[neg_val], (1,), vb.device())?.to_dtype(vb.dtype());
 
         Ok(Self {
             embeddings,
@@ -927,28 +932,20 @@ impl DebertaV2Model {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
+            neg_mask_value: neg_mask_value?,
         })
     }
 
     #[inline]
-    fn make_additive_key_padding_mask(&self, mask_2d: &Tensor) -> candle::Result<Tensor> {
-        // mask_2d: (B, L) in compute dtype, 1.0 real, 0.0 pad
-        let key = mask_2d.to_dtype(self.dtype)?
-                        .unsqueeze(1)?  // (B,1,L)
-                        .unsqueeze(1)?  // (B,1,1,L)
-                        .contiguous()?; // for MPS
+    fn make_additive_key_padding_mask(&self, mask_2d: &Tensor) -> Result<Tensor> {
+        // mask_2d: (B,L) in compute dtype, ~1 real, ~0 pad
+        let key = mask_2d
+            //.to_dtype(self.dtype)?   // optional if caller already did
+            .unsqueeze(1)?            // (B,1,L)
+            .unsqueeze(1)?;           // (B,1,1,L)
 
-        // inv: (B,1,1,L) with 1 where pad, 0 where real
-        let inv = key.eq(0.0f32)?.to_dtype(self.dtype)?;
-
-        // prechoose a finite “-inf” once; f16 uses lowest finite
-        let neg_inf = match self.dtype {
-            DType::F32 => -1.0e9f32,
-            _          => -65504.0f32,
-        };
-        let neg = Tensor::from_slice(&[neg_inf], (1,), &self.device)?.to_dtype(self.dtype)?;
-
-        inv.broadcast_mul(&neg) // (B,1,1,L)
+        let inv = key.le(0.5f32)?.to_dtype(self.dtype)?;  // (B,1,1,L) in {0,1}
+        inv.broadcast_mul(&self.neg_mask_value)           // (B,1,1,L) with {0, -inf_like}
     }
 
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
