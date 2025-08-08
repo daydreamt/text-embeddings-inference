@@ -708,17 +708,26 @@ impl DebertaV2Encoder {
         let relative_pos = self.get_rel_pos(hidden_states)?;
         let relative_embeddings = self.get_rel_embedding()?;
 
-        let mut current_hidden_states = hidden_states.clone();
+        let mut current_ref: &Tensor = hidden_states;
+        let mut current_owned: Option<Tensor> = None;
+
         for layer in &self.layers {
-            current_hidden_states = layer.forward(
-                &current_hidden_states,
+            let next = layer.forward(
+                current_ref,
                 attn_mask,
                 relative_embeddings.as_ref(),
                 relative_pos.as_ref(),
             )?;
+            current_owned = Some(next);
+            current_ref = current_owned.as_ref().unwrap();
         }
-        Ok(current_hidden_states)
+
+        match current_owned {
+            Some(t) => Ok(t),
+            None => bail!("DebertaV2Encoder has no layers"),
+        }
     }
+
 }
 
 pub struct DebertaV2Pooler {
