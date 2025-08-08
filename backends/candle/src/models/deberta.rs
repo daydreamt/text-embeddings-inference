@@ -5,6 +5,8 @@ use candle_nn::{Embedding, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
 use text_embeddings_backend_core::{Batch, ModelType, Pool};
+use std::sync::Mutex;
+
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DebertaV2Config {
@@ -185,6 +187,10 @@ struct DebertaV2DisentangledSelfAttention {
     all_head_size: usize,
     span: tracing::Span,
     device: Device,
+    cached_pos_key_proj: Mutex<Option<Tensor>>,   // (2*att_span, all_head_size)
+    cached_pos_query_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
+    cached_att_span_i64: Tensor,                  // scalar [att_span] as i64
+    cached_att_span_f32: Tensor,                  // scalar [att_span] as f32
 }
 
 impl DebertaV2DisentangledSelfAttention {
@@ -249,6 +255,14 @@ impl DebertaV2DisentangledSelfAttention {
         } else {
             (None, None)
         };
+        let device = vb.device().clone();
+
+        let att_span = if config.position_buckets.unwrap_or(-1) > 0 {
+            config.position_buckets.unwrap()
+        } else {
+            config.max_relative_positions.unwrap_or(config.max_position_embeddings as i64)
+        };
+
 
         Ok(Self {
             query_proj,
@@ -265,7 +279,11 @@ impl DebertaV2DisentangledSelfAttention {
             attention_head_size,
             all_head_size,
             span: tracing::span!(tracing::Level::TRACE, "disentangled_self_attention"),
-            device: vb.device().clone(),
+            device: device.clone(),
+            cached_pos_key_proj: Mutex::new(None),
+            cached_pos_query_proj: Mutex::new(None),
+            cached_att_span_i64: Tensor::new(&[att_span as i64], &device)?,
+            cached_att_span_f32: Tensor::new(&[att_span as f32], &device)?,
         })
     }
 
@@ -350,134 +368,127 @@ impl DebertaV2DisentangledSelfAttention {
             self.max_relative_positions
         };
 
-        // Normalize relative_pos dims without allocating a large buffer.
         let relative_pos = match relative_pos.dims().len() {
             2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
             3 => relative_pos.unsqueeze(1)?,
             4 => relative_pos.clone(),
-            other => bail!(
-                "Relative position ids must be of dim 2, 3, or 4. Got {}",
-                other
-            ),
+            other => bail!("Relative position ids must be of dim 2, 3, or 4. Got {}", other),
         };
 
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        // Lazily accumulate bias terms to avoid a full (B*H, L, L) zero allocation.
-        let mut score: Option<Tensor> = None;
-
-        // Reshape: [2*att_span, hidden] -> [B*H, 2*att_span, d_head] (expand only when bs>1)
-        let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
-            let reshaped = pos_embedding
-                .reshape((2 * att_span as usize, n_head, d_head))?
-                .transpose(0, 1)?; // (H, 2*span, d)
-
-            if bs > 1 {
-                reshaped
-                    .unsqueeze(0)?
-                    .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
-                    .reshape((total_bs_heads, 2 * att_span as usize, d_head))
-            } else {
-                // H == total_bs_heads when bs == 1
-                reshaped.reshape((total_bs_heads, 2 * att_span as usize, d_head))
+        // --- cached projections (base: (2*att_span, all_head_size)) -----------------
+        let get_cached_proj = |cache: &Mutex<Option<Tensor>>,
+                               direct: &dyn Fn(&Tensor) -> Result<Tensor>|
+         -> Result<Tensor> {
+            let mut guard = cache.lock().unwrap();
+            if let Some(t) = guard.as_ref() {
+                return Ok(t.clone());
             }
+            let t = direct(&rel_embeddings)?; // uses layer's weights
+            *guard = Some(t.clone());
+            Ok(t)
         };
 
-        // ---- c2p term -------------------------------------------------------
-        if self.use_c2p_att {
-            let pos_key = if self.share_att_key {
-                self.key_proj.forward(&rel_embeddings)?
-            } else {
-                self.pos_key_proj
-                    .as_ref()
-                    .ok_or_else(|| candle::Error::Msg("pos_key_proj not found".to_string()))?
-                    .forward(&rel_embeddings)?
-            };
+        // reshape base -> (n_head, 2*span, d_head), later repeat(bs) if needed
+        let reshape_base = |base: Tensor| -> Result<Tensor> {
+            base.reshape((2 * att_span as usize, n_head, d_head))?
+                .transpose(0, 1)? // (H, 2*span, d)
+                .contiguous()
+        };
 
-            let pos_key_layer = reshape_pos_embedding(pos_key)?; // (B*H, 2*span, d)
+        // Lazily add terms to avoid preallocating (B*H, L, L).
+        let mut score: Option<Tensor> = None;
+
+        // ---- c2p -----------------------------------------------------------
+        if self.use_c2p_att {
+            let base = if self.share_att_key {
+                // key_proj(rel_embeddings)
+                get_cached_proj(&self.cached_pos_key_proj, &|e| self.key_proj.forward(e))?
+            } else {
+                let proj = self.pos_key_proj
+                    .as_ref()
+                    .ok_or_else(|| candle::Error::Msg("pos_key_proj not found".to_string()))?;
+                get_cached_proj(&self.cached_pos_key_proj, &|e| proj.forward(e))?
+            };
+            let pos_key_layer = {
+                let h_2span_d = reshape_base(base)?; // (H, 2*span, d)
+                if bs > 1 {
+                    h_2span_d
+                        .unsqueeze(0)?
+                        .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
+                        .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
+                } else {
+                    h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
+                }
+            };
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?; // (B*H, Lq, 2*span)
 
             let c2p_pos = relative_pos
-                .broadcast_add(&Tensor::new(&[att_span as i64], relative_pos.device())?)?
+                .broadcast_add(&self.cached_att_span_i64)?   // use cached scalar
                 .clamp(0i64, (2 * att_span - 1) as i64)?
                 .to_dtype(DType::I64)?;
 
             let c2p_indices = c2p_pos
-                .squeeze(0)?
-                .squeeze(0)?
+                .squeeze(0)?.squeeze(0)?
                 .expand(&[total_bs_heads, q_len, k_len])?
-                .contiguous()?; // gather needs a dense index view
+                .contiguous()?;
 
             let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?; // (B*H, Lq, Lk)
             let c2p_scaled = c2p_att_gathered.broadcast_div(&scale_tensor)?;
-
-            score = Some(match score {
-                Some(s) => s.add(&c2p_scaled)?,
-                None => c2p_scaled,
-            });
+            score = Some(match score { Some(s) => s.add(&c2p_scaled)?, None => c2p_scaled });
         }
 
-        // ---- p2c term -------------------------------------------------------
+        // ---- p2c -----------------------------------------------------------
         if self.use_p2c_att {
-            let pos_query = if self.share_att_key {
-                self.query_proj.forward(&rel_embeddings)?
+            let base = if self.share_att_key {
+                // query_proj(rel_embeddings)
+                get_cached_proj(&self.cached_pos_query_proj, &|e| self.query_proj.forward(e))?
             } else {
-                self.pos_query_proj
+                let proj = self.pos_query_proj
                     .as_ref()
-                    .ok_or_else(|| candle::Error::Msg("pos_query_proj not found".to_string()))?
-                    .forward(&rel_embeddings)?
+                    .ok_or_else(|| candle::Error::Msg("pos_query_proj not found".to_string()))?;
+                get_cached_proj(&self.cached_pos_query_proj, &|e| proj.forward(e))?
+            };
+            let pos_query_layer = {
+                let h_2span_d = reshape_base(base)?; // (H, 2*span, d)
+                if bs > 1 {
+                    h_2span_d
+                        .unsqueeze(0)?
+                        .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
+                        .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
+                } else {
+                    h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
+                }
             };
 
-            // If key and query lengths differ, rebuild r_pos; otherwise reuse.
-            let r_pos = if key_layer.dim(1)? != query_layer.dim(1)? {
-                build_relative_position(
-                    key_layer.dim(1)?,
-                    key_layer.dim(1)?,
-                    relative_pos.device(),
-                    Some(self.position_buckets as isize),
-                    Some(self.max_relative_positions as isize),
-                )?
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-            } else {
-                relative_pos.clone()
-            };
-
-            // Avoid allocating a zeros-like tensor; negate in-place type domain.
-            let p2c_pos = r_pos
+            let p2c_pos = relative_pos
                 .to_dtype(DType::F32)?
                 .neg()? // -r_pos
-                .broadcast_add(&Tensor::new(&[att_span as f32], r_pos.device())?)?
+                .broadcast_add(&self.cached_att_span_f32)?  // use cached scalar
                 .clamp(0f32, (2 * att_span - 1) as f32)?
-                .to_dtype(DType::I64)?; // indices for gather
+                .to_dtype(DType::I64)?;
 
-            let pos_query_layer = reshape_pos_embedding(pos_query)?; // (B*H, 2*span, d)
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?; // (B*H, Lk, 2*span)
-
             let p2c_indices = p2c_pos
-                .squeeze(0)?
-                .squeeze(0)?
+                .squeeze(0)?.squeeze(0)?
                 .expand(&[total_bs_heads, k_len, k_len])?
                 .contiguous()?;
 
             let p2c_att_gathered = p2c_att
                 .gather(&p2c_indices, 2)? // (B*H, Lk, Lk)
-                .transpose(1, 2)?; // -> (B*H, Lq, Lk)
+                .transpose(1, 2)?;        // -> (B*H, Lq, Lk)
 
             let p2c_scaled = p2c_att_gathered.broadcast_div(&scale_tensor)?;
-
-            score = Some(match score {
-                Some(s) => s.add(&p2c_scaled)?,
-                None => p2c_scaled,
-            });
+            score = Some(match score { Some(s) => s.add(&p2c_scaled)?, None => p2c_scaled });
         }
 
-        // If neither term is active, return a scalar 0 (broadcasts on add).
         Ok(match score {
             Some(s) => s,
             None => Tensor::new(0f32, query_layer.device())?.to_dtype(query_layer.dtype())?,
         })
     }
+
 }
 struct DebertaV2Attention {
     self_attention: DebertaV2DisentangledSelfAttention,
