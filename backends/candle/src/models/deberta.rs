@@ -313,15 +313,24 @@ impl DebertaV2DisentangledSelfAttention {
             attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, scale)?)?;
         }
 
-        let attn = attn.reshape((b, self.num_attention_heads, l, l))?;
+        // attn: (B*H, L, L)
         let attn = if let Some(mask) = attn_mask {
-            attn.broadcast_add(mask)? // (B,H,L,L) + (B,1,1,L)
+            // mask: (B,1,1,L) → (B,H,1,L) → (B*H,1,L) with the SAME (B,H) ordering as attn
+            let m = mask
+                .squeeze(1)?                // (B,1,L)
+                .squeeze(1)?                // (B,L)
+                .unsqueeze(1)?              // (B,1,L)
+                .unsqueeze(1)?              // (B,1,1,L)
+                .expand(&[b, self.num_attention_heads, 1, l])? // (B,H,1,L) view
+                .contiguous()?              // materialize; keeps MPS happy
+                .reshape((b * self.num_attention_heads, 1, l))?; // (B*H,1,L)
+
+            attn.broadcast_add(&m)?
         } else {
             attn
         };
 
-        let probs = candle_nn::ops::softmax_last_dim(&attn)?;
-        let probs = probs.reshape((b * self.num_attention_heads, l, l))?;
+        let probs = candle_nn::ops::softmax(&attn, D::Minus1)?;
         let ctx = probs.matmul(&v)?;
         ctx.reshape((b, self.num_attention_heads, l, self.attention_head_size))?
             .transpose(1, 2)?
@@ -416,7 +425,7 @@ impl DebertaV2DisentangledSelfAttention {
             let pos_key_layer = if bs > 1 {
                 h_2span_d
                     .repeat(bs)?                // (B*H, 2*span, d)
-                    .contiguous()?              // ensure for Metal
+                    .contiguous()?
                     .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             } else {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
@@ -923,22 +932,22 @@ impl DebertaV2Model {
 
     #[inline]
     fn make_additive_key_padding_mask(&self, mask_2d: &Tensor) -> candle::Result<Tensor> {
-        // mask_2d: (B, L) with 1 for real tokens, 0 for pads
-        let key_mask = mask_2d
-            .to_dtype(self.dtype)?
-            .unsqueeze(1)? // (B, 1, L)
-            .unsqueeze(1)?; // (B, 1, 1, L)
+        // mask_2d: (B, L) in compute dtype, 1.0 real, 0.0 pad
+        let key = mask_2d.to_dtype(self.dtype)?
+                        .unsqueeze(1)?  // (B,1,L)
+                        .unsqueeze(1)?  // (B,1,1,L)
+                        .contiguous()?; // for MPS
 
-        // inv = 1 - key_mask, but make "1" the same shape to avoid scalar-broadcast issues
-        let ones = Tensor::ones_like(&key_mask)?; // (B,1,1,L)
-        let inv = (&ones - &key_mask)?; // (B,1,1,L)
+        // inv: (B,1,1,L) with 1 where pad, 0 where real
+        let inv = key.eq(0.0f32)?.to_dtype(self.dtype)?;
 
-        // convert inv ∈ {0,1} to {0,-INF}
+        // prechoose a finite “-inf” once; f16 uses lowest finite
         let neg_inf = match self.dtype {
             DType::F32 => -1.0e9f32,
-            _ => -65504.0f32, // lowest finite f16
+            _          => -65504.0f32,
         };
         let neg = Tensor::from_slice(&[neg_inf], (1,), &self.device)?.to_dtype(self.dtype)?;
+
         inv.broadcast_mul(&neg) // (B,1,1,L)
     }
 
