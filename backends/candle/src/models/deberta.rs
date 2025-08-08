@@ -289,12 +289,13 @@ impl DebertaV2DisentangledSelfAttention {
 
     #[inline]
     fn reshape_pos(&self, t: Tensor) -> Result<Tensor> {
+        // (2S*H*d) -> (2S, H, d) -> (H, 2S, d)
         t.reshape((
             2 * self.att_span,
             self.num_attention_heads,
             self.attention_head_size,
         ))?
-        .transpose(0, 1) // (n_head, 2*att_span, d_head)
+        .transpose(0, 1)
     }
 
     fn pos_key_layer_cached(&self, rel_e: &Tensor) -> Result<Option<Tensor>> {
@@ -349,7 +350,7 @@ impl DebertaV2DisentangledSelfAttention {
             device,
             Some(self.position_buckets as isize),
             Some(self.max_relative_positions as isize),
-        )?; // (1,L,L) I64
+        )?; // (1,L,L), I64
 
         let att_span = self.att_span as i64;
         let shift = Tensor::new(&[att_span], device)?;
@@ -359,14 +360,16 @@ impl DebertaV2DisentangledSelfAttention {
         let c2p = rel
             .broadcast_add(&shift)?
             .clamp(0i64, max_idx)?
-            .to_dtype(DType::I64)?;
+            .to_dtype(DType::I64)?
+            .contiguous()?;
         // p2c: clamp((-rel) + att_span)
         let zero = Tensor::zeros_like(&rel)?;
         let neg_rel = zero.broadcast_sub(&rel)?;
         let p2c = neg_rel
             .broadcast_add(&shift)?
             .clamp(0i64, max_idx)?
-            .to_dtype(DType::I64)?;
+            .to_dtype(DType::I64)?
+            .contiguous()?;
 
         self.idx_cache
             .lock()
@@ -435,10 +438,10 @@ impl DebertaV2DisentangledSelfAttention {
     }
     fn disentangled_attention_bias(
         &self,
-        query_layer: &Tensor,
-        key_layer: &Tensor,
-        relative_pos_view: &Tensor,
-        rel_embeddings: &Tensor,
+        query_layer: &Tensor,       // (bh, Q, d)
+        key_layer: &Tensor,         // (bh, K, d)
+        relative_pos_view: &Tensor, // usually (1,L,L)
+        rel_embeddings: &Tensor,    // (2S, hidden)
         scale: f64,
     ) -> Result<Tensor> {
         let (bh, q_len, d_head) = query_layer.dims3()?;
@@ -451,24 +454,47 @@ impl DebertaV2DisentangledSelfAttention {
             return Tensor::zeros((bh, q_len, k_len), query_layer.dtype(), device);
         }
 
+        // (1) cached projected rel-embeddings (H, 2S, d)
         let rel_e = rel_embeddings.to_dtype(query_layer.dtype())?;
-        let pos_key_layer = self.pos_key_layer_cached(&rel_e)?; // Option<Tensor> (n_head, 2S, d)
+        let pos_key_layer = self.pos_key_layer_cached(&rel_e)?; // Option<Tensor>
         let pos_query_layer = self.pos_query_layer_cached(&rel_e)?; // Option<Tensor>
 
-        // equal-length fast path cache
-        let idx_pair_opt: Option<(Tensor, Tensor)> = if q_len == k_len {
-            Some(self.indices_for_len(q_len, device)?)
+        // (2) cached small indices (1,L,L) → squeeze to (L,L)
+        let (c2p_idx_2d, p2c_idx_2d) = if q_len == k_len {
+            let (c2p_base, p2c_base) = self.indices_for_len(q_len, device)?;
+            (c2p_base.squeeze(0)?, p2c_base.squeeze(0)?)
         } else {
-            None
+            // rare fallback: derive from provided view
+            let att_span = self.att_span as i64;
+            let rel2d = match relative_pos_view.dims().len() {
+                2 => relative_pos_view.clone(),
+                3 => relative_pos_view.squeeze(0)?,
+                4 => relative_pos_view.squeeze(0)?.squeeze(0)?,
+                n => bail!("relative_pos_view must be 2/3/4-D, got {}", n),
+            };
+            let c2p = rel2d
+                .broadcast_add(&Tensor::new(&[att_span], device)?)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .to_dtype(DType::I64)?
+                .contiguous()?;
+            let zero = Tensor::zeros_like(&rel2d)?;
+            let neg = zero.broadcast_sub(&rel2d)?;
+            let p2c = neg
+                .broadcast_add(&Tensor::new(&[att_span], device)?)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .to_dtype(DType::I64)?
+                .contiguous()?;
+            (c2p, p2c)
         };
 
-        let inv_scale = 1.0f32 / (scale as f32);
-        let inv_scale_t = Tensor::new(inv_scale, device)?.to_dtype(query_layer.dtype())?;
+        let inv_scale_t =
+            Tensor::new(1.0f32 / (scale as f32), device)?.to_dtype(query_layer.dtype())?;
 
         let mut score: Option<Tensor> = None;
 
-        // ---- C2P ----
+        // ---- C2P: (bh, Q, 2S) → gather with (L,L) per (bh) → (bh, Q, K)
         if let Some(pos_key) = pos_key_layer {
+            // expand over batch (small float broadcast, not L^2 indices)
             let pos_key_bh = if bs > 1 {
                 pos_key
                     .unsqueeze(0)?
@@ -477,25 +503,18 @@ impl DebertaV2DisentangledSelfAttention {
             } else {
                 pos_key.reshape((bh, 2 * self.att_span, d_head))?
             };
-            let c2p = query_layer.matmul(&pos_key_bh.transpose(1, 2)?)?; // (bh, q, 2S)
+            let c2p_logits = query_layer.matmul(&pos_key_bh.transpose(1, 2)?)?; // (bh, Q, 2S)
 
-            let c2p_idx = if let Some((ref c2p_base, _)) = idx_pair_opt {
-                // NOTE: help type inference by cloning (owned Tensor)
-                c2p_base.clone().expand(&[bh, q_len, k_len])?.contiguous()?
-            } else {
-                let att_span = self.att_span as i64;
-                relative_pos_view
-                    .broadcast_add(&Tensor::new(&[att_span], device)?)?
-                    .clamp(0i64, (2 * att_span - 1) as i64)?
-                    .to_dtype(DType::I64)?
-                    .expand(&[bh, q_len, k_len])?
-                    .contiguous()?
-            };
-            let gathered = c2p.gather(&c2p_idx, D::Minus1)?;
-            score = Some(gathered.broadcast_mul(&inv_scale_t)?);
+            let mut parts = Vec::with_capacity(bh);
+            for i in 0..bh {
+                let row = c2p_logits.i(i)?; // (Q, 2S)
+                parts.push(row.gather(&c2p_idx_2d, D::Minus1)?); // (Q, K)
+            }
+            let c2p_gathered = Tensor::stack(&parts, 0)?; // (bh, Q, K)
+            score = Some(c2p_gathered.broadcast_mul(&inv_scale_t)?);
         }
 
-        // ---- P2C ----
+        // ---- P2C: (bh, K, 2S) → gather with (L,L) per (bh) → (bh, K, K) → transpose to (bh, Q, K)
         if let Some(pos_query) = pos_query_layer {
             let pos_query_bh = if bs > 1 {
                 pos_query
@@ -505,25 +524,19 @@ impl DebertaV2DisentangledSelfAttention {
             } else {
                 pos_query.reshape((bh, 2 * self.att_span, d_head))?
             };
-            let p2c = key_layer.matmul(&pos_query_bh.transpose(1, 2)?)?; // (bh, k, 2S)
+            let p2c_logits = key_layer.matmul(&pos_query_bh.transpose(1, 2)?)?; // (bh, K, 2S)
 
-            let p2c_idx = if let Some((_, ref p2c_base)) = idx_pair_opt {
-                p2c_base.clone().expand(&[bh, k_len, k_len])?.contiguous()?
-            } else {
-                let att_span = self.att_span as i64;
-                let zero = Tensor::zeros_like(relative_pos_view)?;
-                let neg = zero.broadcast_sub(relative_pos_view)?;
-                neg.broadcast_add(&Tensor::new(&[att_span], device)?)?
-                    .clamp(0i64, (2 * att_span - 1) as i64)?
-                    .to_dtype(DType::I64)?
-                    .expand(&[bh, k_len, k_len])?
-                    .contiguous()?
-            };
-
-            let gathered = p2c.gather(&p2c_idx, 2)?.transpose(1, 2)?;
+            let mut parts = Vec::with_capacity(bh);
+            for i in 0..bh {
+                let row = p2c_logits.i(i)?; // (K, 2S)
+                parts.push(row.gather(&p2c_idx_2d, D::Minus1)?); // (K, K)
+            }
+            let p2c_gathered = Tensor::stack(&parts, 0)?; // (bh, K, K)
+            let p2c_gathered = p2c_gathered.transpose(1, 2)?; // -> (bh, K, K) (no-op when Q==K)
+            let term = p2c_gathered.broadcast_mul(&inv_scale_t)?;
             score = Some(match score {
-                Some(s) => s.add(&gathered.broadcast_mul(&inv_scale_t)?)?,
-                None => gathered.broadcast_mul(&inv_scale_t)?,
+                Some(s) => s.add(&term)?,
+                None => term,
             });
         }
 
