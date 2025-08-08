@@ -428,12 +428,16 @@ impl DebertaV2DisentangledSelfAttention {
                 .clamp(0i64, (2 * att_span - 1) as i64)?
                 .to_dtype(DType::I64)?;
 
-            let c2p_indices = c2p_pos
-                .squeeze(0)?.squeeze(0)?
-                .expand(&[total_bs_heads, q_len, k_len])?
-                .contiguous()?;
-
-            let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?; // (B*H, Lq, Lk)
+            let base = c2p_pos.squeeze(0)?.squeeze(0)?;               // (Lq, Lk)
+            let c2p_indices = if total_bs_heads > 1 {
+                base.unsqueeze(0)?
+                    .repeat(total_bs_heads)?                           // (B*H, Lq, Lk)
+                    .contiguous()?
+                    .to_dtype(DType::U32)?
+            } else {
+                base.unsqueeze(0)?.to_dtype(DType::U32)?
+            };
+            let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
             let c2p_scaled = c2p_att_gathered.broadcast_div(&scale_tensor)?;
             score = Some(match score { Some(s) => s.add(&c2p_scaled)?, None => c2p_scaled });
         }
@@ -467,10 +471,16 @@ impl DebertaV2DisentangledSelfAttention {
                 .clamp(0f32, (2 * att_span - 1) as f32)?
                 .to_dtype(DType::I64)?;
 
-            let p2c_indices = p2c_pos
-                .squeeze(0)?.squeeze(0)?
-                .expand(&[total_bs_heads, k_len, k_len])?
-                .contiguous()?;
+            let base = p2c_pos.squeeze(0)?.squeeze(0)?;
+            let p2c_indices = if total_bs_heads > 1 {
+                base.unsqueeze(0)?
+                    .repeat(total_bs_heads)?
+                    .contiguous()?
+                    .to_dtype(DType::U32)?
+            } else {
+                base.unsqueeze(0)?.to_dtype(DType::U32)?
+            };
+            let p2c_att_gathered = p2c_att.gather(&p2c_indices, 2)?.transpose(1, 2)?;
 
             let p2c_att_gathered = p2c_att
                 .gather(&p2c_indices, 2)? // (B*H, Lk, Lk)
