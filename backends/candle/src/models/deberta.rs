@@ -173,7 +173,8 @@ struct DebertaV2DisentangledSelfAttention {
     query_proj: Linear,
     key_proj: Linear,
     value_proj: Linear,
-    pos_att_type: Vec<String>,
+    use_c2p_att: bool,
+    use_p2c_att: bool,
     max_relative_positions: i64,
     position_buckets: i64,
     share_att_key: bool,
@@ -214,6 +215,9 @@ impl DebertaV2DisentangledSelfAttention {
 
         let share_att_key = config.share_att_key.unwrap_or(false);
         let pos_att_type = config.pos_att_type.clone().unwrap_or_default();
+        let use_c2p_att = pos_att_type.iter().any(|t| t == "c2p");
+        let use_p2c_att = pos_att_type.iter().any(|t| t == "p2c");
+
         let relative_attention = config.relative_attention;
         let mut max_relative_positions = config.max_relative_positions.unwrap_or(-1);
         if max_relative_positions < 1 {
@@ -221,7 +225,7 @@ impl DebertaV2DisentangledSelfAttention {
         }
 
         let (pos_key_proj, pos_query_proj) = if relative_attention && !share_att_key {
-            let pos_key_proj = if pos_att_type.iter().any(|t| t == "c2p" || t == "p2p") {
+            let pos_key_proj = if use_c2p_att {
                 Some(Linear::new(
                     vb.pp("pos_key_proj")
                         .get((all_head_size, config.hidden_size), "weight")?,
@@ -231,7 +235,7 @@ impl DebertaV2DisentangledSelfAttention {
             } else {
                 None
             };
-            let pos_query_proj = if pos_att_type.iter().any(|t| t == "p2c" || t == "p2p") {
+            let pos_query_proj = if use_p2c_att {
                 Some(Linear::new(
                     vb.pp("pos_query_proj")
                         .get((all_head_size, config.hidden_size), "weight")?,
@@ -250,7 +254,8 @@ impl DebertaV2DisentangledSelfAttention {
             query_proj,
             key_proj,
             value_proj,
-            pos_att_type,
+            use_c2p_att,
+            use_p2c_att,
             max_relative_positions,
             position_buckets: config.position_buckets.unwrap_or(-1),
             share_att_key,
@@ -281,16 +286,8 @@ impl DebertaV2DisentangledSelfAttention {
         let mut attn = q.matmul(&k.transpose(1, 2)?)?;
         let scale = (self.attention_head_size as f64
             * (1.0
-                + if self.pos_att_type.iter().any(|s| s == "c2p") {
-                    1.0
-                } else {
-                    0.0
-                }
-                + if self.pos_att_type.iter().any(|s| s == "p2c") {
-                    1.0
-                } else {
-                    0.0
-                }))
+                + if self.use_c2p_att { 1.0 } else { 0.0 }
+                + if self.use_p2c_att { 1.0 } else { 0.0 }))
         .sqrt();
         attn = (attn * (1.0f64 / scale))?;
 
@@ -371,7 +368,6 @@ impl DebertaV2DisentangledSelfAttention {
             query_layer.device(),
         )?;
 
-        // Improved reshape function that minimizes operations
         let reshape_pos_embedding = |pos_embedding: Tensor| -> Result<Tensor> {
             // Reshape: [2*att_span, hidden] -> [n_head, 2*att_span, d_head]
             let reshaped = pos_embedding
@@ -389,7 +385,7 @@ impl DebertaV2DisentangledSelfAttention {
             }
         };
 
-        if self.pos_att_type.iter().any(|s| s == "c2p") {
+        if self.use_c2p_att {
             let pos_key = if self.share_att_key {
                 self.key_proj.forward(&rel_embeddings)?
             } else {
@@ -417,7 +413,7 @@ impl DebertaV2DisentangledSelfAttention {
             score = score.add(&c2p_att_scaled)?;
         }
 
-        if self.pos_att_type.iter().any(|s| s == "p2c") {
+        if self.use_p2c_att {
             let pos_query = if self.share_att_key {
                 self.query_proj.forward(&rel_embeddings)?
             } else {
