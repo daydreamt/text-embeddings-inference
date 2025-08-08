@@ -390,12 +390,13 @@ impl DebertaV2DisentangledSelfAttention {
             Ok(t)
         };
 
-        // reshape base -> (n_head, 2*span, d_head), later repeat(bs) if needed
+        // helper keeps the base in (H, 2*span, d), contiguous
         let reshape_base = |base: Tensor| -> Result<Tensor> {
             base.reshape((2 * att_span as usize, n_head, d_head))?
                 .transpose(0, 1)? // (H, 2*span, d)
                 .contiguous()
         };
+
 
         // Lazily add terms to avoid preallocating (B*H, L, L).
         let mut score: Option<Tensor> = None;
@@ -411,18 +412,16 @@ impl DebertaV2DisentangledSelfAttention {
                     .ok_or_else(|| candle::Error::Msg("pos_key_proj not found".to_string()))?;
                 get_cached_proj(&self.cached_pos_key_proj, &|e| proj.forward(e))?
             };
-            let pos_key_layer = {
-                let h_2span_d = reshape_base(base)?; // (H, 2*span, d)
-                if bs > 1 {
-                    h_2span_d
-                        .unsqueeze(0)?
-                        .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
-                        .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
-                } else {
-                    h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
-                }
+            let h_2span_d = reshape_base(base)?; // (H, 2*span, d), contiguous
+            let pos_key_layer = if bs > 1 {
+                h_2span_d
+                    .repeat(bs)?                // (B*H, 2*span, d)
+                    .contiguous()?              // ensure for Metal
+                    .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
+            } else {
+                h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
-            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?; // (B*H, Lq, 2*span)
+            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
 
             let c2p_pos = relative_pos
                 .broadcast_add(&self.cached_att_span_i64)?   // use cached scalar
@@ -450,17 +449,16 @@ impl DebertaV2DisentangledSelfAttention {
                     .ok_or_else(|| candle::Error::Msg("pos_query_proj not found".to_string()))?;
                 get_cached_proj(&self.cached_pos_query_proj, &|e| proj.forward(e))?
             };
-            let pos_query_layer = {
-                let h_2span_d = reshape_base(base)?; // (H, 2*span, d)
-                if bs > 1 {
-                    h_2span_d
-                        .unsqueeze(0)?
-                        .expand(&[bs, n_head, 2 * att_span as usize, d_head])?
-                        .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
-                } else {
-                    h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
-                }
+            let h_2span_d = reshape_base(base)?; // (H, 2*span, d), contiguous
+            let pos_query_layer = if bs > 1 {
+                h_2span_d
+                    .repeat(bs)?                // (B*H, 2*span, d)
+                    .contiguous()?              // ensure for Metal
+                    .reshape((total_bs_heads, 2 * att_span as usize, d_head))?
+            } else {
+                h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
+            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
 
             let p2c_pos = relative_pos
                 .to_dtype(DType::F32)?
@@ -469,7 +467,6 @@ impl DebertaV2DisentangledSelfAttention {
                 .clamp(0f32, (2 * att_span - 1) as f32)?
                 .to_dtype(DType::I64)?;
 
-            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?; // (B*H, Lk, 2*span)
             let p2c_indices = p2c_pos
                 .squeeze(0)?.squeeze(0)?
                 .expand(&[total_bs_heads, k_len, k_len])?
