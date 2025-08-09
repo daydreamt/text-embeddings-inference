@@ -101,7 +101,7 @@ impl DebertaV2Embeddings {
         let embed_proj = if embedding_size != hidden_size {
             let proj = Linear::new(
                 vb.pp("embed_proj")
-                    .get((embedding_size, hidden_size), "weight")?, // (embedding_size, hidden_size)
+                    .get((embedding_size, hidden_size), "weight")?,
                 None,
                 None,
             );
@@ -138,32 +138,32 @@ impl DebertaV2Embeddings {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
 
-        let mut x = self.word_embeddings.forward(input_ids)?;
+        // Token + (optional) position + (optional) proj + (optional) token-type
+        let mut embeddings = self.word_embeddings.forward(input_ids)?;
 
         if let Some(ref position_embeddings) = self.position_embeddings {
-            x = x.add(&position_embeddings.forward(position_ids)?)?;
+            embeddings = embeddings.add(&position_embeddings.forward(position_ids)?)?;
         }
         if let Some(proj) = &self.embed_proj {
-            x = proj.forward(&x)?;
+            embeddings = proj.forward(&embeddings)?;
         }
         if let Some(ref token_type_embeddings) = self.token_type_embeddings {
-            x = x.add(&token_type_embeddings.forward(token_type_ids)?)?;
+            embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
 
-        let mut embeddings = self.layer_norm.forward(&x, None)?;
+        // LayerNorm first (matches Candle), then zero pad positions if mask is provided.
+        let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
 
-        // Apply 0/1 mask to zero out pad positions in embeddings
         if let Some(mask) = attention_mask {
             let mut mask = mask.clone();
             if mask.dims() != embeddings.dims() {
                 if mask.dims().len() == 4 {
-                    // Accept (B,1,1,L) too
+                    // accept (B,1,1,L)
                     mask = mask.squeeze(1)?.squeeze(1)?;
                 }
                 // (B,L) -> (B,L,1) to broadcast over hidden
                 mask = mask.unsqueeze(2)?;
             }
-            // keep compute dtype (fp16/bf16 on GPU)
             mask = mask.to_dtype(embeddings.dtype())?;
             embeddings = embeddings.broadcast_mul(&mask)?;
         }
@@ -309,13 +309,13 @@ impl DebertaV2DisentangledSelfAttention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_mask: Option<&Tensor>, // expects key-only additive mask (B,1,1,L)
+        attn_mask: Option<&Tensor>, // key-only additive (B,1,1,L) or None
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, l, _) = hidden_states.dims3()?;
 
-        // Q, K, V -> (B*H, L, d_head)
+        // Q,K,V -> (B*H, L, d_head)
         let q = self.transpose_for_scores(self.query_proj.forward(hidden_states)?, b, l)?;
         let k = self.transpose_for_scores(self.key_proj.forward(hidden_states)?, b, l)?;
         let v = self.transpose_for_scores(self.value_proj.forward(hidden_states)?, b, l)?;
@@ -336,22 +336,22 @@ impl DebertaV2DisentangledSelfAttention {
             attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, scale)?)?;
         }
 
-        // Additive mask in 4D, then softmax along last dim (portable & fast on Metal)
+        // Mask + softmax in 4D (portable, fast on Metal)
         let probs = if let Some(mask) = attn_mask {
             let attn4 = attn.reshape((b, self.num_attention_heads, l, l))?;
             let attn4 = attn4.broadcast_add(mask)?; // (B,H,L,L) + (B,1,1,L)
-            candle_nn::ops::softmax_last_dim(&attn4)? // (B,H,L,L)
-                .reshape((b * self.num_attention_heads, l, l))? // (B*H,L,L)
+            candle_nn::ops::softmax_last_dim(&attn4)? // over keys
+                .reshape((b * self.num_attention_heads, l, l))?
         } else {
-            candle_nn::ops::softmax_last_dim(&attn)? // (B*H,L,L)
+            candle_nn::ops::softmax_last_dim(&attn)? // (B*H, L, L)
         };
 
-        // Context
+        // Context -> (B,L,all_head)
         probs
-            .matmul(&v)? // (B*H,L,d_head)
+            .matmul(&v)?
             .reshape((b, self.num_attention_heads, l, self.attention_head_size))?
-            .transpose(1, 2)? // (B,L,H,d_head)
-            .contiguous()? // keep Metal/MPS happy
+            .transpose(1, 2)?
+            .contiguous()?
             .reshape((b, l, self.all_head_size))
     }
 
@@ -363,8 +363,7 @@ impl DebertaV2DisentangledSelfAttention {
         rel_embeddings: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
-        let (total_bs_heads, q_len, d_head) = query_layer.dims3()?;
-        let _k_len = key_layer.dim(1)?;
+        let (total_bs_heads, _q_len, d_head) = query_layer.dims3()?;
         let n_head = self.num_attention_heads;
         let bs = total_bs_heads / n_head;
 
@@ -410,7 +409,7 @@ impl DebertaV2DisentangledSelfAttention {
 
         let mut score: Option<Tensor> = None;
 
-        // c2p
+        // ---- c2p -----------------------------------------------------------
         if self.use_c2p_att {
             let base = if self.share_att_key {
                 get_cached_proj(&self.cached_pos_key_proj, &|e| self.key_proj.forward(e))?
@@ -455,7 +454,7 @@ impl DebertaV2DisentangledSelfAttention {
             });
         }
 
-        // p2c (remove duplicate gather; keep single gather+transpose)
+        // ---- p2c -----------------------------------------------------------
         if self.use_p2c_att {
             let base = if self.share_att_key {
                 get_cached_proj(&self.cached_pos_query_proj, &|e| self.query_proj.forward(e))?
@@ -946,18 +945,16 @@ impl DebertaV2Model {
 
     #[inline]
     fn make_additive_key_padding_mask(&self, mask_2d: &Tensor) -> Result<Tensor> {
-        // mask_2d: (B,L) in compute dtype, 1.0 for real, 0.0 for pad
-        let key = mask_2d
-            .unsqueeze(1)? // (B,1,L)
-            .unsqueeze(1)?; // (B,1,1,L)
+        // mask_2d: (B,L) in compute dtype, 1.0=real, 0.0=pad
+        let key = mask_2d.unsqueeze(1)?.unsqueeze(1)?; // (B,1,1,L)
 
-        // Build threshold in the same dtype as `key` to avoid backend upcasts
+        // Threshold in the same dtype to avoid fp32 upcasts on MPS/CUDA.
         let thr = Tensor::new(0.5f32, key.device())?
             .to_dtype(key.dtype())?
             .broadcast_as(key.shape())?;
 
         let inv = key.le(&thr)?.to_dtype(self.dtype)?; // (B,1,1,L) in {0,1}
-        inv.broadcast_mul(&self.neg_mask_value) // (B,1,1,L) with {0, -big}
+        inv.broadcast_mul(&self.neg_mask_value) // (B,1,1,L) in {0,-big}
     }
 
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
@@ -1030,6 +1027,7 @@ impl DebertaV2Model {
         let pooled_embeddings = if has_pooling_requests {
             self.pool_embeddings(
                 encoder_output.clone(),
+                attention_mask_2d.as_ref(),
                 &batch,
                 &input_lengths,
                 has_raw_requests,
@@ -1056,7 +1054,8 @@ impl DebertaV2Model {
 
     fn pool_embeddings(
         &self,
-        mut outputs: Tensor,
+        mut outputs: Tensor,      // (B,L,H)
+        mask_2d: Option<&Tensor>, // (B,L) or None
         batch: &Batch,
         input_lengths: &[f32],
         has_raw_requests: bool,
@@ -1080,26 +1079,38 @@ impl DebertaV2Model {
                     outputs.i((.., 0))?
                 }
             }
-            Pool::LastToken => {
-                bail!("LastToken pooling is not supported for DebertaV2")
-            }
             Pool::Mean => {
-                let input_lengths_tensor = if has_raw_requests && pooled_indices_length > 0 {
-                    let selected_lengths: Vec<f32> = batch
+                // Zero out pad positions at the output stage if a mask is provided.
+                if let Some(m2d) = mask_2d {
+                    let mut m2d = m2d.clone();
+                    if has_raw_requests && pooled_indices_length > 0 {
+                        let pooled_indices_tensor = Tensor::from_vec(
+                            batch.pooled_indices.clone(),
+                            pooled_indices_length,
+                            &self.device,
+                        )?;
+                        m2d = m2d.index_select(&pooled_indices_tensor, 0)?;
+                    }
+                    outputs = outputs.broadcast_mul(&m2d.unsqueeze(2)?)?;
+                }
+
+                // Divide by true lengths of the selected rows.
+                let denom = if has_raw_requests && pooled_indices_length > 0 {
+                    let selected: Vec<f32> = batch
                         .pooled_indices
                         .iter()
                         .map(|&idx| input_lengths[idx as usize])
                         .collect();
-                    Tensor::from_vec(selected_lengths, (pooled_indices_length, 1), &self.device)?
+                    Tensor::from_vec(selected, (pooled_indices_length, 1), &self.device)?
                         .to_dtype(self.dtype)?
                 } else {
                     Tensor::from_vec(input_lengths.to_vec(), (batch.len(), 1), &self.device)?
                         .to_dtype(self.dtype)?
                 };
 
-                outputs.sum(1)?.broadcast_div(&input_lengths_tensor)?
+                outputs.sum(1)?.broadcast_div(&denom)?
             }
-            Pool::Splade => unreachable!(),
+            Pool::LastToken | Pool::Splade => unreachable!(),
         };
 
         Ok(Some(pooled_embeddings))
