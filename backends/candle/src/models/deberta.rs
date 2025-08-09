@@ -1051,13 +1051,18 @@ impl DebertaV2Model {
     ) -> Result<Option<Tensor>> {
         let pooled_indices_length = batch.pooled_indices.len();
 
-        if has_raw_requests && pooled_indices_length > 0 {
-            let pooled_indices_tensor = Tensor::from_vec(
+        // Build once and reuse for outputs and masks.
+        let pooled_indices_tensor = if has_raw_requests && pooled_indices_length > 0 {
+            Some(Tensor::from_vec(
                 batch.pooled_indices.clone(),
                 pooled_indices_length,
                 &self.device,
-            )?;
-            outputs = outputs.index_select(&pooled_indices_tensor, 0)?;
+            )?)
+        } else {
+            None
+        };
+        if let Some(ref idx) = pooled_indices_tensor {
+            outputs = outputs.index_select(idx, 0)?;
         }
 
         let pooled_embeddings = match self.pool {
@@ -1069,42 +1074,47 @@ impl DebertaV2Model {
                 }
             }
             Pool::Mean => {
-                // Zero out pad positions at the output stage if a mask is provided.
-                if let Some(m2d) = mask_2d {
-                    let mut m2d = m2d.clone();
-                    if has_raw_requests && pooled_indices_length > 0 {
-                        let pooled_indices_tensor = Tensor::from_vec(
-                            batch.pooled_indices.clone(),
-                            pooled_indices_length,
-                            &self.device,
-                        )?;
-                        m2d = m2d.index_select(&pooled_indices_tensor, 0)?;
-                    }
+                // If a mask exists, compute denom from it on-device; otherwise fall back to input_lengths.
+                if let Some(m2d_in) = mask_2d {
+                    // Select mask rows if needed and zero out padded tokens.
+                    let m2d = if let Some(ref idx) = pooled_indices_tensor {
+                        m2d_in.index_select(idx, 0)?
+                    } else {
+                        m2d_in.clone()
+                    };
                     outputs = outputs.broadcast_mul(&m2d.unsqueeze(2)?)?;
-                }
 
-                // Divide by true lengths of the selected rows.
-                let mut denom = if has_raw_requests && pooled_indices_length > 0 {
-                    let selected: Vec<f32> = batch
-                        .pooled_indices
-                        .iter()
-                        .map(|&idx| input_lengths[idx as usize])
-                        .collect();
-                    Tensor::from_vec(selected, (pooled_indices_length, 1), &self.device)?
-                        .to_dtype(self.dtype)?
+                    // denom = sum over tokens of the (selected) mask
+                    let mut denom = m2d.sum(1)?.unsqueeze(1)?.to_dtype(self.dtype)?;
+                    let eps = Tensor::new(1e-6f32, &self.device)?.to_dtype(self.dtype)?;
+                    let zero_mask =
+                        denom.le(&Tensor::new(0.5f32, &self.device)?.to_dtype(self.dtype)?)?;
+                    denom = denom.broadcast_add(&eps)?;
+                    let mean = outputs.sum(1)?.broadcast_div(&denom)?;
+                    let zeros = mean.zeros_like()?;
+                    zero_mask.where_cond(&zeros, &mean)?
                 } else {
-                    Tensor::from_vec(input_lengths.to_vec(), (batch.len(), 1), &self.device)?
-                        .to_dtype(self.dtype)?
-                };
-
-                // Avoid divide-by-zero -> NaN, and force zero output when length==0.
-                let eps = Tensor::new(1e-6f32, &self.device)?.to_dtype(self.dtype)?;
-                let zero_mask =
-                    denom.le(&Tensor::new(0.5f32, &self.device)?.to_dtype(self.dtype)?)?; // U8 mask
-                denom = denom.broadcast_add(&eps)?;
-                let mean = outputs.sum(1)?.broadcast_div(&denom)?;
-                let zeros = mean.zeros_like()?;
-                zero_mask.where_cond(&zeros, &mean)?
+                    // No mask: use provided input_lengths.
+                    let mut denom = if let Some(_) = pooled_indices_tensor {
+                        let selected: Vec<f32> = batch
+                            .pooled_indices
+                            .iter()
+                            .map(|&idx| input_lengths[idx as usize])
+                            .collect();
+                        Tensor::from_vec(selected, (pooled_indices_length, 1), &self.device)?
+                            .to_dtype(self.dtype)?
+                    } else {
+                        Tensor::from_vec(input_lengths.to_vec(), (batch.len(), 1), &self.device)?
+                            .to_dtype(self.dtype)?
+                    };
+                    let eps = Tensor::new(1e-6f32, &self.device)?.to_dtype(self.dtype)?;
+                    let zero_mask =
+                        denom.le(&Tensor::new(0.5f32, &self.device)?.to_dtype(self.dtype)?)?;
+                    denom = denom.broadcast_add(&eps)?;
+                    let mean = outputs.sum(1)?.broadcast_div(&denom)?;
+                    let zeros = mean.zeros_like()?;
+                    zero_mask.where_cond(&zeros, &mean)?
+                }
             }
             Pool::LastToken | Pool::Splade => unreachable!(),
         };
