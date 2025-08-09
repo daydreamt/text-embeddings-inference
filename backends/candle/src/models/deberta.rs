@@ -134,7 +134,7 @@ impl DebertaV2Embeddings {
         input_ids: &Tensor,
         token_type_ids: &Tensor,
         position_ids: &Tensor,
-        _attention_mask: Option<&Tensor>, // mask no longer applied here
+        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
 
@@ -150,8 +150,25 @@ impl DebertaV2Embeddings {
             x = x.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
 
-        // Return LN(emb) — masking is handled in attention
-        self.layer_norm.forward(&x, None)
+        let mut embeddings = self.layer_norm.forward(&x, None)?;
+
+        // Apply 0/1 mask to zero out pad positions in embeddings
+        if let Some(mask) = attention_mask {
+            let mut mask = mask.clone();
+            if mask.dims() != embeddings.dims() {
+                if mask.dims().len() == 4 {
+                    // Accept (B,1,1,L) too
+                    mask = mask.squeeze(1)?.squeeze(1)?;
+                }
+                // (B,L) -> (B,L,1) to broadcast over hidden
+                mask = mask.unsqueeze(2)?;
+            }
+            // keep compute dtype (fp16/bf16 on GPU)
+            mask = mask.to_dtype(embeddings.dtype())?;
+            embeddings = embeddings.broadcast_mul(&mask)?;
+        }
+
+        Ok(embeddings)
     }
 }
 
