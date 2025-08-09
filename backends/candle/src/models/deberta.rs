@@ -175,7 +175,6 @@ struct DebertaV2DisentangledSelfAttention {
     cached_pos_key_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
     cached_pos_query_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
     cached_att_span_i64: Tensor,                // scalar [att_span] as i64
-    cached_att_span_f32: Tensor,                // scalar [att_span] as f32
 }
 
 impl DebertaV2DisentangledSelfAttention {
@@ -186,6 +185,7 @@ impl DebertaV2DisentangledSelfAttention {
         let all_head_size = config.num_attention_heads * attention_head_size;
         let hidden = config.hidden_size;
 
+        // Fused QKV for the content path.
         let qw = vb.pp("query_proj").get((all_head_size, hidden), "weight")?;
         let qb = vb.pp("query_proj").get(all_head_size, "bias")?;
         let kw = vb.pp("key_proj").get((all_head_size, hidden), "weight")?;
@@ -197,7 +197,7 @@ impl DebertaV2DisentangledSelfAttention {
         let qkv_b = Tensor::cat(&[&qb, &kb, &vbias], 0)?;
         let qkv_linear = Linear::new(qkv_w, Some(qkv_b), None);
 
-        // keep slim Q/K linears for the share_att_key branch of rel-emb
+        // Keep slim Q/K linears for the share_att_key branch of rel-emb.
         let content_q_proj_for_rel = Linear::new(qw.clone(), Some(qb.clone()), None);
         let content_k_proj_for_rel = Linear::new(kw.clone(), Some(kb.clone()), None);
 
@@ -213,7 +213,6 @@ impl DebertaV2DisentangledSelfAttention {
         }
 
         let (pos_key_proj, pos_query_proj) = if relative_attention && !share_att_key {
-            // TODO: Fuse these too?
             let pos_key_proj = if use_c2p_att {
                 Some(Linear::new(
                     vb.pp("pos_key_proj")
@@ -238,6 +237,7 @@ impl DebertaV2DisentangledSelfAttention {
         } else {
             (None, None)
         };
+
         let device = vb.device().clone();
 
         let att_span = if config.position_buckets.unwrap_or(-1) > 0 {
@@ -267,30 +267,31 @@ impl DebertaV2DisentangledSelfAttention {
             cached_pos_key_proj: Mutex::new(None),
             cached_pos_query_proj: Mutex::new(None),
             cached_att_span_i64: Tensor::new(&[att_span as i64], &device)?,
-            cached_att_span_f32: Tensor::new(&[att_span as f32], &device)?,
         })
     }
 
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_4d: Option<&Tensor>, // (B*H, L, L) or None
+        attn_bias_4d: Option<&Tensor>, // (B,H,L,L) or None
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, l, _) = hidden_states.dims3()?;
 
-        let qkv = self.qkv_linear.forward(hidden_states)?; // (B,L,3H*d)
-        let (b, l, _) = hidden_states.dims3()?;
-        let qkv = qkv
+        // Fused QKV -> split to (B*H, L, d)
+        let qkv = self
+            .qkv_linear
+            .forward(hidden_states)?
             .reshape((b, l, self.num_attention_heads * 3, self.attention_head_size))?
-            .transpose(1, 2)?; // (B,3H,L,d)
+            .transpose(1, 2)?; // (B, 3H, L, d)
         let chunks = qkv.chunk(3, 1)?;
         let q = chunks[0].contiguous()?.reshape((
             b * self.num_attention_heads,
             l,
             self.attention_head_size,
         ))?;
+        let q_raw = q.clone();
         let k = chunks[1].contiguous()?.reshape((
             b * self.num_attention_heads,
             l,
@@ -302,35 +303,34 @@ impl DebertaV2DisentangledSelfAttention {
             self.attention_head_size,
         ))?;
 
-        // Content scores
-        let mut attn = q.matmul(&k.transpose(1, 2)?)?; // (B*H, L, L)
-
-        // Scale (accounts for c2p/p2c)
-        let scale = (self.attention_head_size as f64
-            * (1.0
-                + if self.use_c2p_att { 1.0 } else { 0.0 }
-                + if self.use_p2c_att { 1.0 } else { 0.0 }))
-        .sqrt();
-        attn = (attn * (1.0f64 / scale))?;
-
-        // Relative bias
-        if let (Some(rel_e), Some(rel_p)) = (relative_embeddings, relative_pos) {
-            attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, scale)?)?;
+        // Scale like the fast reference: divide K by sqrt(d * scale_factor).
+        let mut scale_factor: usize = 1;
+        if self.use_c2p_att {
+            scale_factor += 1;
+        }
+        if self.use_p2c_att {
+            scale_factor += 1;
         }
 
-        // Mask + softmax: prefer 4D path when bias is provided (portable, stable on MPS)
-        let probs = if let Some(bias4d) = attn_bias_4d {
-            let attn4 = attn
-                .reshape((b, self.num_attention_heads, l, l))?
-                .add(bias4d)?; // (B,H,L,L)
-            candle_nn::ops::softmax_last_dim(&attn4)?.reshape((
-                b * self.num_attention_heads,
-                l,
-                l,
-            ))?
-        } else {
-            candle_nn::ops::softmax_last_dim(&attn)? // (B*H, L, L)
-        };
+        let inv_scale: f64 = ((self.attention_head_size * scale_factor) as f64)
+            .sqrt()
+            .recip();
+
+        // Scale a copy of Q once, then Q @ K^T.
+        let q_scaled = (q_raw.clone() * inv_scale)?; // f32/f16-safe scalar mul
+        let mut attn = q_scaled.matmul(&k.transpose(1, 2)?)?; // (B*H, L, L)
+
+        // Relative bias (uses the same scalar inv_scale)
+        if let (Some(rel_e), Some(rel_p)) = (relative_embeddings, relative_pos) {
+            // Use UNscaled q for the disentangled paths to avoid double scaling.
+            attn =
+                attn.add(&self.disentangled_attention_bias(&q_raw, &k, rel_p, rel_e, inv_scale)?)?;
+        }
+
+        if let Some(bias4d) = attn_bias_4d {
+            attn = attn.add(&bias4d.reshape((b * self.num_attention_heads, l, l))?)?;
+        }
+        let probs = candle_nn::ops::softmax_last_dim(&attn)?;
 
         // Context -> (B,L,all_head)
         probs
@@ -343,18 +343,15 @@ impl DebertaV2DisentangledSelfAttention {
 
     fn disentangled_attention_bias(
         &self,
-        query_layer: &Tensor,
-        key_layer: &Tensor,
-        relative_pos: &Tensor,
-        rel_embeddings: &Tensor,
-        scale: f64,
+        query_layer: &Tensor,    // (B*H, Lq, d)
+        key_layer: &Tensor,      // (B*H, Lk, d)
+        relative_pos: &Tensor,   // 2D/3D/4D; normalized below
+        rel_embeddings: &Tensor, // (2*att_span, hidden)
+        inv_scale: f64,          // 1 / sqrt(d * scale_factor)
     ) -> Result<Tensor> {
         let (total_bs_heads, _q_len, d_head) = query_layer.dims3()?;
         let n_head = self.num_attention_heads;
         let bs = total_bs_heads / n_head;
-
-        let scale_tensor =
-            Tensor::new(scale as f32, query_layer.device())?.to_dtype(query_layer.dtype())?;
 
         let att_span = if self.position_buckets > 0 {
             self.position_buckets
@@ -362,6 +359,7 @@ impl DebertaV2DisentangledSelfAttention {
             self.max_relative_positions
         };
 
+        // Normalize relative_pos to 4D: (1,1,Lq,Lk)
         let relative_pos = match relative_pos.dims().len() {
             2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
             3 => relative_pos.unsqueeze(1)?,
@@ -372,9 +370,10 @@ impl DebertaV2DisentangledSelfAttention {
             ),
         };
 
+        // Match dtypes once.
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        // cached projections
+        // Helper: cache projector outputs on rel_embeddings.
         let get_cached_proj = |cache: &Mutex<Option<Tensor>>,
                                direct: &dyn Fn(&Tensor) -> Result<Tensor>|
          -> Result<Tensor> {
@@ -387,6 +386,7 @@ impl DebertaV2DisentangledSelfAttention {
             Ok(t)
         };
 
+        // Reshape projector output to (H, 2*span, d)
         let reshape_base = |base: Tensor| -> Result<Tensor> {
             base.reshape((2 * att_span as usize, n_head, d_head))?
                 .transpose(0, 1)? // (H, 2*span, d)
@@ -395,7 +395,7 @@ impl DebertaV2DisentangledSelfAttention {
 
         let mut score: Option<Tensor> = None;
 
-        // ---- c2p -----------------------------------------------------------
+        // ---- c2p ----
         if self.use_c2p_att {
             let base = if self.share_att_key {
                 get_cached_proj(&self.cached_pos_key_proj, &|e| {
@@ -406,7 +406,13 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_key_proj, &|e| proj.forward(e))?
             };
 
-            let h_2span_d = reshape_base(base)?;
+            // let h_2span_d = reshape_base(base)?; // (H,2*span,d)
+            // let pos_key_layer = h_2span_d
+            //    .unsqueeze(0)?
+            //    .broadcast_as((bs, n_head, 2 * att_span as usize, d_head))?
+            //    .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
+            let h_2span_d = reshape_base(base)?; // (H,2*span,d)
+                                                 // Materialize with repeat for better matmul perf.
             let pos_key_layer = if bs > 1 {
                 h_2span_d.repeat(bs)?.contiguous()?.reshape((
                     total_bs_heads,
@@ -416,31 +422,30 @@ impl DebertaV2DisentangledSelfAttention {
             } else {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
+
             let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
 
+            // integer-only indices
             let c2p_pos = relative_pos
                 .broadcast_add(&self.cached_att_span_i64)?
                 .clamp(0i64, (2 * att_span - 1) as i64)?
-                .to_dtype(DType::I64)?;
+                .squeeze(0)?
+                .squeeze(0)?; // (Lq,Lk)
 
-            let base = c2p_pos.squeeze(0)?.squeeze(0)?; // (Lq,Lk)
-            let c2p_indices = if total_bs_heads > 1 {
-                base.unsqueeze(0)?
-                    .repeat(total_bs_heads)?
-                    .contiguous()?
-                    .to_dtype(DType::U32)?
-            } else {
-                base.unsqueeze(0)?.to_dtype(DType::U32)?
-            };
+            let c2p_indices = c2p_pos
+                .unsqueeze(0)?
+                .broadcast_as((total_bs_heads, c2p_pos.dim(0)?, c2p_pos.dim(1)?))?
+                .to_dtype(DType::U32)?;
+
             let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
-            let c2p_scaled = c2p_att_gathered.broadcast_div(&scale_tensor)?;
+            let c2p_scaled = (c2p_att_gathered * inv_scale)?;
             score = Some(match score {
                 Some(s) => s.add(&c2p_scaled)?,
                 None => c2p_scaled,
             });
         }
 
-        // ---- p2c -----------------------------------------------------------
+        // ---- p2c ----
         if self.use_p2c_att {
             let base = if self.share_att_key {
                 get_cached_proj(&self.cached_pos_query_proj, &|e| {
@@ -454,7 +459,8 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_query_proj, &|e| proj.forward(e))?
             };
 
-            let h_2span_d = reshape_base(base)?;
+            let h_2span_d = reshape_base(base)?; // (H,2*span,d)
+                                                 // Materialize with repeat for better matmul perf.
             let pos_query_layer = if bs > 1 {
                 h_2span_d.repeat(bs)?.contiguous()?.reshape((
                     total_bs_heads,
@@ -464,30 +470,24 @@ impl DebertaV2DisentangledSelfAttention {
             } else {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
+
             let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
 
-            let p2c_pos = relative_pos
-                .to_dtype(DType::F32)?
-                .neg()?
-                .broadcast_add(&self.cached_att_span_f32)?
-                .clamp(0f32, (2 * att_span - 1) as f32)?
-                .to_dtype(DType::I64)?;
+            // integer-only: att_span - rel_pos
+            let p2c_pos = self
+                .cached_att_span_i64
+                .broadcast_sub(&relative_pos)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .squeeze(0)?
+                .squeeze(0)?; // (Lq,Lk)
 
-            let base = p2c_pos.squeeze(0)?.squeeze(0)?;
-            let p2c_indices = if total_bs_heads > 1 {
-                base.unsqueeze(0)?
-                    .repeat(total_bs_heads)?
-                    .contiguous()?
-                    .to_dtype(DType::U32)?
-            } else {
-                base.unsqueeze(0)?.to_dtype(DType::U32)?
-            };
+            let p2c_indices = p2c_pos
+                .unsqueeze(0)?
+                .broadcast_as((total_bs_heads, p2c_pos.dim(0)?, p2c_pos.dim(1)?))?
+                .to_dtype(DType::U32)?;
 
-            let p2c_att_gathered = p2c_att
-                .gather(&p2c_indices, 2)? // (B*H, Lk, Lk)
-                .transpose(1, 2)?; // -> (B*H, Lq, Lk)
-
-            let p2c_scaled = p2c_att_gathered.broadcast_div(&scale_tensor)?;
+            let p2c_att_gathered = p2c_att.gather(&p2c_indices, D::Minus1)?.transpose(1, 2)?;
+            let p2c_scaled = (p2c_att_gathered * inv_scale)?;
             score = Some(match score {
                 Some(s) => s.add(&p2c_scaled)?,
                 None => p2c_scaled,
@@ -496,7 +496,7 @@ impl DebertaV2DisentangledSelfAttention {
 
         Ok(match score {
             Some(s) => s,
-            None => Tensor::new(0f32, query_layer.device())?.to_dtype(query_layer.dtype())?,
+            None => query_layer.zeros_like()?,
         })
     }
 }
