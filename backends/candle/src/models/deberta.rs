@@ -273,7 +273,7 @@ impl DebertaV2DisentangledSelfAttention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_4d: Option<&Tensor>, // (B,H,L,L) or None
+        attn_bias_bhl: Option<&Tensor>, // (BH,L,L) or None
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
@@ -286,22 +286,10 @@ impl DebertaV2DisentangledSelfAttention {
             .reshape((b, l, self.num_attention_heads * 3, self.attention_head_size))?
             .transpose(1, 2)?; // (B, 3H, L, d)
         let chunks = qkv.chunk(3, 1)?;
-        let q = chunks[0].contiguous()?.reshape((
-            b * self.num_attention_heads,
-            l,
-            self.attention_head_size,
-        ))?;
+        let q = chunks[0].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
         let q_raw = q.clone();
-        let k = chunks[1].contiguous()?.reshape((
-            b * self.num_attention_heads,
-            l,
-            self.attention_head_size,
-        ))?;
-        let v = chunks[2].contiguous()?.reshape((
-            b * self.num_attention_heads,
-            l,
-            self.attention_head_size,
-        ))?;
+        let k = chunks[1].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
+        let v = chunks[2].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
 
         // Scale like the fast reference: divide K by sqrt(d * scale_factor).
         let mut scale_factor: usize = 1;
@@ -316,8 +304,8 @@ impl DebertaV2DisentangledSelfAttention {
             .sqrt()
             .recip();
 
-        // Scale a copy of Q once, then Q @ K^T.
-        let q_scaled = (q_raw.clone() * inv_scale)?; // f32/f16-safe scalar mul
+        // Scale Q once, then Q @ K^T (drop extra clone).
+        let q_scaled = (&q_raw * inv_scale)?; // f32/f16-safe scalar mul
         let mut attn = q_scaled.matmul(&k.transpose(1, 2)?)?; // (B*H, L, L)
 
         // Relative bias (uses the same scalar inv_scale)
@@ -327,8 +315,9 @@ impl DebertaV2DisentangledSelfAttention {
                 attn.add(&self.disentangled_attention_bias(&q_raw, &k, rel_p, rel_e, inv_scale)?)?;
         }
 
-        if let Some(bias4d) = attn_bias_4d {
-            attn = attn.add(&bias4d.reshape((b * self.num_attention_heads, l, l))?)?;
+        if let Some(bias_bhl) = attn_bias_bhl {
+            // Mask already provided as (BH,L,L); avoid per-layer reshape.
+            attn = attn.add(bias_bhl)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&attn)?;
 
@@ -538,14 +527,14 @@ impl DebertaV2Attention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_4d: Option<&Tensor>,
+        attn_bias_bhl: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let self_out = self.self_attention.forward(
             hidden_states,
-            attn_bias_4d,
+            attn_bias_bhl,
             relative_embeddings,
             relative_pos,
         )?;
@@ -603,14 +592,14 @@ impl DebertaV2Layer {
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_4d: Option<&Tensor>,
+        attn_bias_bhl: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let x = self.attention.forward(
             hidden_states,
-            attn_bias_4d,
+            attn_bias_bhl,
             relative_embeddings,
             relative_pos,
         )?;
@@ -759,10 +748,11 @@ impl DebertaV2Encoder {
 
         let (b, l, _) = hidden_states.dims3()?;
         let h = self.layers[0].attention.self_attention.num_attention_heads;
-        let attn_bias_4d: Option<Tensor> = match attn_mask_b11l {
+        // Build (BH,L,L) once; pass through layers without reshaping again.
+        let attn_bias_bhl: Option<Tensor> = match attn_mask_b11l {
             Some(m) => {
                 // m: (B,1,1,L) with {0,-big}
-                Some(m.broadcast_as((b, h, l, l))?.contiguous()?)
+                Some(m.broadcast_as((b, h, l, l))?.reshape((b * h, l, l))?)
             }
             None => None,
         };
@@ -773,7 +763,7 @@ impl DebertaV2Encoder {
         for layer in &self.layers {
             let next = layer.forward(
                 current_ref,
-                attn_bias_4d.as_ref(),
+                attn_bias_bhl.as_ref(),
                 relative_embeddings.as_ref(),
                 relative_pos.as_ref(),
             )?;
