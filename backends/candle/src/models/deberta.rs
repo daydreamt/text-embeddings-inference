@@ -134,7 +134,6 @@ impl DebertaV2Embeddings {
         input_ids: &Tensor,
         token_type_ids: &Tensor,
         position_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
 
@@ -151,24 +150,8 @@ impl DebertaV2Embeddings {
             embeddings = embeddings.add(&token_type_embeddings.forward(token_type_ids)?)?;
         }
 
-        // LayerNorm first (matches Candle), then zero pad positions if mask is provided.
-        let mut embeddings = self.layer_norm.forward(&embeddings, None)?;
-
-        if let Some(mask) = attention_mask {
-            let mut mask = mask.clone();
-            if mask.dims() != embeddings.dims() {
-                if mask.dims().len() == 4 {
-                    // accept (B,1,1,L)
-                    mask = mask.squeeze(1)?.squeeze(1)?;
-                }
-                // (B,L) -> (B,L,1) to broadcast over hidden
-                mask = mask.unsqueeze(2)?;
-            }
-            mask = mask.to_dtype(embeddings.dtype())?;
-            embeddings = embeddings.broadcast_mul(&mask)?;
-        }
-
-        Ok(embeddings)
+        // LN only (we do not zero pad here; masking is handled in attention/pooling).
+        self.layer_norm.forward(&embeddings, None)
     }
 }
 
@@ -301,15 +284,15 @@ impl DebertaV2DisentangledSelfAttention {
 
         transposed.reshape((
             batch_size * self.num_attention_heads,
-            transposed.dim(2)?, // This should be seq_len, but get it from tensor
-            transposed.dim(3)?, // This should be attention_head_size
+            transposed.dim(2)?, // seq_len
+            transposed.dim(3)?, // attention_head_size
         ))
     }
 
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_mask: Option<&Tensor>, // key-only additive (B,1,1,L) or None
+        attn_bias_3d: Option<&Tensor>, // (B*H, L, L) or None
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
@@ -336,15 +319,13 @@ impl DebertaV2DisentangledSelfAttention {
             attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, scale)?)?;
         }
 
-        // Mask + softmax in 4D (portable, fast on Metal)
-        let probs = if let Some(mask) = attn_mask {
-            let attn4 = attn.reshape((b, self.num_attention_heads, l, l))?;
-            let attn4 = attn4.broadcast_add(mask)?; // (B,H,L,L) + (B,1,1,L)
-            candle_nn::ops::softmax_last_dim(&attn4)? // over keys
-                .reshape((b * self.num_attention_heads, l, l))?
-        } else {
-            candle_nn::ops::softmax_last_dim(&attn)? // (B*H, L, L)
-        };
+        // Additive key padding bias pre-expanded to (B*H, L, L)
+        if let Some(bias) = attn_bias_3d {
+            attn = attn.add(bias)?;
+        }
+
+        // Softmax over keys (3D path)
+        let probs = candle_nn::ops::softmax_last_dim(&attn)?; // (B*H, L, L)
 
         // Context -> (B,L,all_head)
         probs
@@ -511,6 +492,7 @@ impl DebertaV2DisentangledSelfAttention {
         })
     }
 }
+
 struct DebertaV2Attention {
     self_attention: DebertaV2DisentangledSelfAttention,
     dense: Linear,
@@ -548,14 +530,14 @@ impl DebertaV2Attention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_mask: Option<&Tensor>,
+        attn_bias_3d: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let self_out = self.self_attention.forward(
             hidden_states,
-            attn_mask,
+            attn_bias_3d,
             relative_embeddings,
             relative_pos,
         )?;
@@ -613,14 +595,17 @@ impl DebertaV2Layer {
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_mask: Option<&Tensor>,
+        attn_bias_3d: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
         relative_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let x =
-            self.attention
-                .forward(hidden_states, attn_mask, relative_embeddings, relative_pos)?;
+        let x = self.attention.forward(
+            hidden_states,
+            attn_bias_3d,
+            relative_embeddings,
+            relative_pos,
+        )?;
         let h = self.intermediate.forward(&x)?;
         self.layer_norm.forward(&self.output.forward(&h)?, Some(&x))
     }
@@ -688,12 +673,11 @@ impl DebertaV2Encoder {
         };
         let norm_rel_ebd = config.norm_rel_ebd.as_deref().unwrap_or("none");
         let layer_norm = if norm_rel_ebd.contains("layer_norm") {
-            let ln = LayerNorm::load(
+            Some(LayerNorm::load(
                 vb.pp("LayerNorm"),
                 config.hidden_size,
                 config.layer_norm_eps as f32,
-            )?;
-            Some(ln)
+            )?)
         } else {
             None
         };
@@ -760,10 +744,22 @@ impl DebertaV2Encoder {
         Ok(self.rel_embeddings_cached.clone())
     }
 
-    fn forward(&self, hidden_states: &Tensor, attn_mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attn_mask_b11l: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
         let relative_pos = self.get_rel_pos(hidden_states)?;
         let relative_embeddings = self.get_rel_embedding()?;
+
+        // Pre-broadcast additive key padding mask once to (B*H, L, L)
+        let (b, l, _) = hidden_states.dims3()?;
+        let h = self.layers[0].attention.self_attention.num_attention_heads;
+        let attn_bias_3d: Option<Tensor> = match attn_mask_b11l {
+            Some(m) => {
+                // m: (B,1,1,L) with {0,-big}
+                let m4 = m.broadcast_as((b, h, l, l))?.contiguous()?;
+                Some(m4.reshape((b * h, l, l))?)
+            }
+            None => None,
+        };
 
         let mut current_ref: &Tensor = hidden_states;
         let mut current_owned: Option<Tensor> = None;
@@ -771,7 +767,7 @@ impl DebertaV2Encoder {
         for layer in &self.layers {
             let next = layer.forward(
                 current_ref,
-                attn_mask,
+                attn_bias_3d.as_ref(),
                 relative_embeddings.as_ref(),
                 relative_pos.as_ref(),
             )?;
@@ -861,21 +857,17 @@ impl DebertaV2Pooler {
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let first_token = hidden_states.i((.., 0))?;
-
         let pooled = self.dense.forward(&first_token)?;
-
         let activated = match self.activation {
             HiddenAct::Gelu => pooled.gelu(),
             HiddenAct::Relu => pooled.relu(),
             HiddenAct::Silu => pooled.silu(),
             _ => unreachable!("Invalid activation should have been caught during loading"),
         }?;
-
         let result = match &self.classifier {
             Some(classifier) => classifier.forward(&activated),
             None => Ok(activated),
         };
-
         result
     }
 
@@ -924,9 +916,11 @@ impl DebertaV2Model {
 
         let embeddings = DebertaV2Embeddings::load(vb.pp("deberta.embeddings"), config)?;
         let encoder = DebertaV2Encoder::load(vb.pp("deberta.encoder"), config)?;
+
+        // Use a large finite negative to avoid NaNs when an attention row is fully masked.
         let neg_val = match vb.dtype() {
             DType::F32 => -1.0e9f32,
-            _ => -65504.0f32, // f16 lowest finite; -1e4 also works
+            _ => -65504.0f32,
         };
         let neg_mask_value =
             Tensor::from_slice(&[neg_val], (1,), vb.device())?.to_dtype(vb.dtype());
@@ -1005,13 +999,12 @@ impl DebertaV2Model {
             None
         };
 
-        let embedding_output = self.embeddings.forward(
-            &input_ids,
-            &type_ids,
-            &position_ids,
-            attention_mask_2d.as_ref(),
-        )?;
+        // Embeddings (no mask multiply here)
+        let embedding_output = self
+            .embeddings
+            .forward(&input_ids, &type_ids, &position_ids)?;
 
+        // Build key-only additive mask (B,1,1,L) once
         let attention_add_mask: Option<Tensor> = match &attention_mask_2d {
             Some(m) => Some(self.make_additive_key_padding_mask(m)?),
             None => None,
