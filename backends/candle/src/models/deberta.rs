@@ -287,7 +287,6 @@ impl DebertaV2DisentangledSelfAttention {
             .transpose(1, 2)?; // (B, 3H, L, d)
         let chunks = qkv.chunk(3, 1)?;
         let q = chunks[0].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
-        let q_raw = q.clone();
         let k = chunks[1].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
         let v = chunks[2].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
 
@@ -305,14 +304,13 @@ impl DebertaV2DisentangledSelfAttention {
             .recip();
 
         // Scale Q once, then Q @ K^T (drop extra clone).
-        let q_scaled = (&q_raw * inv_scale)?; // f32/f16-safe scalar mul
+        let q_scaled = (&q * inv_scale)?; // f32/f16-safe scalar mul
         let mut attn = q_scaled.matmul(&k.transpose(1, 2)?)?; // (B*H, L, L)
 
         // Relative bias (uses the same scalar inv_scale)
         if let (Some(rel_e), Some(rel_p)) = (relative_embeddings, relative_pos) {
             // Use UNscaled q for the disentangled paths to avoid double scaling.
-            attn =
-                attn.add(&self.disentangled_attention_bias(&q_raw, &k, rel_p, rel_e, inv_scale)?)?;
+            attn = attn.add(&self.disentangled_attention_bias(&q, &k, rel_p, rel_e, inv_scale)?)?;
         }
 
         if let Some(bias_bhl) = attn_bias_bhl {
