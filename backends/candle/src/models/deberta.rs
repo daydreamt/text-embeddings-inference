@@ -395,11 +395,6 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_key_proj, &|e| proj.forward(e))?
             };
 
-            // let h_2span_d = reshape_base(base)?; // (H,2*span,d)
-            // let pos_key_layer = h_2span_d
-            //    .unsqueeze(0)?
-            //    .broadcast_as((bs, n_head, 2 * att_span as usize, d_head))?
-            //    .reshape((total_bs_heads, 2 * att_span as usize, d_head))?;
             let h_2span_d = reshape_base(base)?; // (H,2*span,d)
                                                  // Materialize with repeat for better matmul perf.
             let pos_key_layer = if bs > 1 {
@@ -751,8 +746,12 @@ impl DebertaV2Encoder {
         // Build (BH,L,L) once; pass through layers without reshaping again.
         let attn_bias_bhl: Option<Tensor> = match attn_mask_b11l {
             Some(m) => {
-                // m: (B,1,1,L) with {0,-big}
-                Some(m.broadcast_as((b, h, l, l))?.reshape((b * h, l, l))?)
+                // (B,1,1,L) -> (B,H,L,L) -> materialize -> (B*H,L,L)
+                let bias = m
+                    .broadcast_as((b, h, l, l))?
+                    .contiguous()?
+                    .reshape((b * h, l, l))?;
+                Some(bias)
             }
             None => None,
         };
