@@ -783,7 +783,7 @@ impl DebertaV2Encoder {
             .narrow(1, 0, l)?
             .narrow(2, 0, l)?
             .squeeze(0)?
-            .contiguous()?; // (L,L) I64
+            .contiguous()?; // (L,L) U32
         let p2c = self
             .p2c_full_u32
             .as_ref()
@@ -791,7 +791,7 @@ impl DebertaV2Encoder {
             .narrow(1, 0, l)?
             .narrow(2, 0, l)?
             .squeeze(0)?
-            .contiguous()?; // (L,L) I64;
+            .contiguous()?; // (L,L) U32
         Ok((c2p, p2c))
     }
 
@@ -801,47 +801,107 @@ impl DebertaV2Encoder {
 
         let (b, l, _) = hidden_states.dims3()?;
         let h = self.layers[0].attention.self_attention.num_attention_heads;
-        // Build (BH,L,L) once; pass through layers without reshaping again.
-        let attn_bias_bhl: Option<Tensor> = match attn_mask_b11l {
-            Some(m) => {
-                // (B,1,1,L) -> (B,H,L,L) -> materialize -> (B*H,L,L)
+        // Adaptive share for (BH,L,L) bias: only pre-broadcast if small enough
+        let (attn_bias_bhl_shared, share_bias) = if let Some(m) = attn_mask_b11l {
+            let bh = b * h;
+            let l_usize = l as usize;
+            let bias_bytes: usize = (bh as usize) * l_usize * l_usize * 4; // f32
+                                                                           // Share up to B=8 (H=12, L=512) -> BH*L^2*4 = 96 MiB
+            const BIAS_SHARE_BYTES_LIMIT: usize = 96 * 1024 * 1024;
+            if bias_bytes <= BIAS_SHARE_BYTES_LIMIT {
                 let bias = m
                     .broadcast_as((b, h, l, l))?
                     .contiguous()?
-                    .reshape((b * h, l, l))?;
-                Some(bias)
+                    .reshape((bh, l, l))?;
+                (Some(bias), true)
+            } else {
+                (None, false)
             }
-            None => None,
+        } else {
+            (None, false)
         };
 
         let mut current_ref: &Tensor = hidden_states;
         let mut current_owned: Option<Tensor> = None;
 
-        let (c2p_idx_bhl, p2c_idx_bhl) = if self.relative_attention {
-            let (c2p_l_l, p2c_l_l) = self.get_c2p_p2c_indices(l)?;
-            let c2p_bhl = c2p_l_l
-                .unsqueeze(0)?
-                .broadcast_as((b * h, l, l))?
-                .contiguous()?;
-            let p2c_bhl = p2c_l_l
-                .unsqueeze(0)?
-                .broadcast_as((b * h, l, l))?
-                .contiguous()?;
-            (Some(c2p_bhl), Some(p2c_bhl))
+        // Adaptive broadcast: pre-materialize (BH,L,L) only if it's not too large.
+        let (c2p_idx_bhl_shared, p2c_idx_bhl_shared, share_indices) = if self.relative_attention {
+            let bh = b * h;
+            let l_usize = l as usize;
+            // Two U32 tables: 2 * BH * L * L * 4 bytes
+            let idx_bytes: usize = 2 * (bh as usize) * l_usize * l_usize * 4;
+            // Share up to B=8 (H=12, L=512) -> 2*BH*L^2*4 = 192 MiB
+            const IDX_SHARE_BYTES_LIMIT: usize = 192 * 1024 * 1024;
+            if idx_bytes <= IDX_SHARE_BYTES_LIMIT {
+                let (c2p_l_l, p2c_l_l) = self.get_c2p_p2c_indices(l)?;
+                let c2p = c2p_l_l
+                    .unsqueeze(0)?
+                    .broadcast_as((bh, l, l))?
+                    .contiguous()?;
+                let p2c = p2c_l_l
+                    .unsqueeze(0)?
+                    .broadcast_as((bh, l, l))?
+                    .contiguous()?;
+                (Some(c2p), Some(p2c), true)
+            } else {
+                (None, None, false)
+            }
         } else {
-            (None, None)
+            (None, None, false)
         };
 
+        // Pre-take shared refs once
+        let shared_c2p_ref = c2p_idx_bhl_shared.as_ref();
+        let shared_p2c_ref = p2c_idx_bhl_shared.as_ref();
+        let shared_bias_ref = attn_bias_bhl_shared.as_ref();
+
         for layer in &self.layers {
-            let next = layer.forward(
-                current_ref,
-                attn_bias_bhl.as_ref(),
-                relative_embeddings.as_ref(),
-                c2p_idx_bhl.as_ref(),
-                p2c_idx_bhl.as_ref(),
-            )?;
-            current_owned = Some(next);
-            current_ref = current_owned.as_ref().unwrap();
+            if self.relative_attention && !share_indices {
+                // Build per-layer temporaries and pass by reference
+                let (c2p_l_l, p2c_l_l) = self.get_c2p_p2c_indices(l)?;
+                let c2p_tmp = c2p_l_l
+                    .unsqueeze(0)?
+                    .broadcast_as((b * h, l, l))?
+                    .contiguous()?;
+                let p2c_tmp = p2c_l_l
+                    .unsqueeze(0)?
+                    .broadcast_as((b * h, l, l))?
+                    .contiguous()?;
+                // bias: share when small, else build per-layer tmp if mask exists
+                let bias_tmp;
+                let bias_ref = if !share_bias {
+                    if let Some(m) = attn_mask_b11l {
+                        bias_tmp =
+                            m.broadcast_as((b, h, l, l))?
+                                .contiguous()?
+                                .reshape((b * h, l, l))?;
+                        Some(&bias_tmp)
+                    } else {
+                        None
+                    }
+                } else {
+                    shared_bias_ref
+                };
+                let next = layer.forward(
+                    current_ref,
+                    bias_ref,
+                    relative_embeddings.as_ref(),
+                    Some(&c2p_tmp),
+                    Some(&p2c_tmp),
+                )?;
+                current_owned = Some(next);
+                current_ref = current_owned.as_ref().unwrap();
+            } else {
+                let next = layer.forward(
+                    current_ref,
+                    shared_bias_ref,
+                    relative_embeddings.as_ref(),
+                    shared_c2p_ref,
+                    shared_p2c_ref,
+                )?;
+                current_owned = Some(next);
+                current_ref = current_owned.as_ref().unwrap();
+            }
         }
 
         match current_owned {
