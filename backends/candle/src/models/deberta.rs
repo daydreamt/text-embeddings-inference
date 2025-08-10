@@ -175,6 +175,8 @@ struct DebertaV2DisentangledSelfAttention {
     cached_pos_key_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
     cached_pos_query_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
     cached_att_span_i64: Tensor,                // scalar [att_span] as i64
+    pos_key_h2span_cache: Mutex<Option<Tensor>>,   // (H, 2*span, d)
+    pos_query_h2span_cache: Mutex<Option<Tensor>>, // (H, 2*span, d)
 }
 
 impl DebertaV2DisentangledSelfAttention {
@@ -267,6 +269,9 @@ impl DebertaV2DisentangledSelfAttention {
             cached_pos_key_proj: Mutex::new(None),
             cached_pos_query_proj: Mutex::new(None),
             cached_att_span_i64: Tensor::new(&[att_span as i64], &device)?,
+            pos_key_h2span_cache: Mutex::new(None),
+            pos_query_h2span_cache: Mutex::new(None),
+
         })
     }
 
@@ -398,6 +403,22 @@ impl DebertaV2DisentangledSelfAttention {
                 .contiguous()
         };
 
+        // Cached accessors for reshaped per-head tensors
+        let get_pos_key_h2span = |raw: Tensor| -> Result<Tensor> {
+            let mut g = self.pos_key_h2span_cache.lock().unwrap();
+            if let Some(t) = g.as_ref() { return Ok(t.clone()); }
+            let t = reshape_base(raw)?;
+            *g = Some(t.clone());
+            Ok(t)
+        };
+        let get_pos_query_h2span = |raw: Tensor| -> Result<Tensor> {
+            let mut g = self.pos_query_h2span_cache.lock().unwrap();
+            if let Some(t) = g.as_ref() { return Ok(t.clone()); }
+            let t = reshape_base(raw)?;
+            *g = Some(t.clone());
+            Ok(t)
+        };
+    
         let mut score: Option<Tensor> = None;
 
         // ---- c2p ----
@@ -411,8 +432,9 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_key_proj, &|e| proj.forward(e))?
             };
 
-            let h_2span_d = reshape_base(base)?; // (H,2*span,d)
-                                                 // Materialize with repeat for better matmul perf.
+            // (H,2*span,d) cached
+            let h_2span_d = get_pos_key_h2span(base)?; // (H,2*span,d)
+
             let pos_key_layer = if bs > 1 {
                 h_2span_d.repeat(bs)?.contiguous()?.reshape((
                     total_bs_heads,
@@ -465,8 +487,8 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_query_proj, &|e| proj.forward(e))?
             };
 
-            let h_2span_d = reshape_base(base)?; // (H,2*span,d)
-                                                 // Materialize with repeat for better matmul perf.
+            // (H,2*span,d) cached
+            let h_2span_d = get_pos_query_h2span(base)?; // (H,2*span,d)
             let pos_query_layer = if bs > 1 {
                 h_2span_d.repeat(bs)?.contiguous()?.reshape((
                     total_bs_heads,
