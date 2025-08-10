@@ -175,7 +175,7 @@ struct DebertaV2DisentangledSelfAttention {
     cached_pos_key_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
     cached_pos_query_proj: Mutex<Option<Tensor>>, // (2*att_span, all_head_size)
     cached_att_span_i64: Tensor,                // scalar [att_span] as i64
-    pos_key_h2span_cache: Mutex<Option<Tensor>>,   // (H, 2*span, d)
+    pos_key_h2span_cache: Mutex<Option<Tensor>>, // (H, 2*span, d)
     pos_query_h2span_cache: Mutex<Option<Tensor>>, // (H, 2*span, d)
 }
 
@@ -271,7 +271,6 @@ impl DebertaV2DisentangledSelfAttention {
             cached_att_span_i64: Tensor::new(&[att_span as i64], &device)?,
             pos_key_h2span_cache: Mutex::new(None),
             pos_query_h2span_cache: Mutex::new(None),
-
         })
     }
 
@@ -280,9 +279,8 @@ impl DebertaV2DisentangledSelfAttention {
         hidden_states: &Tensor,
         attn_bias_bhl: Option<&Tensor>, // (BH,L,L) or None
         relative_embeddings: Option<&Tensor>,
-        relative_pos: Option<&Tensor>,     // (1,L,L) or (1,1,L,L)
-        c2p_base_idx_l_l: Option<&Tensor>, // (L,L) I64 bucketed, precomputed
-        p2c_base_idx_l_l: Option<&Tensor>, // (L,L) I64 bucketed, precomputed
+        c2p_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
+        p2c_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
     ) -> Result<Tensor> {
         let (b, l, _) = hidden_states.dims3()?;
 
@@ -319,11 +317,10 @@ impl DebertaV2DisentangledSelfAttention {
             attn = attn.add(&self.disentangled_attention_bias(
                 &q,
                 &k,
-                relative_pos,
                 rel_e,
                 inv_scale,
-                c2p_base_idx_l_l,
-                p2c_base_idx_l_l,
+                c2p_idx_bhl,
+                p2c_idx_bhl,
             )?)?;
         }
 
@@ -344,13 +341,12 @@ impl DebertaV2DisentangledSelfAttention {
 
     fn disentangled_attention_bias(
         &self,
-        query_layer: &Tensor,              // (B*H, Lq, d)
-        key_layer: &Tensor,                // (B*H, Lk, d)
-        relative_pos: Option<&Tensor>, // 2D/3D/4D; normalized below (unused if indices are provided)
-        rel_embeddings: &Tensor,       // (2*att_span, hidden)
-        inv_scale: f64,                // 1 / sqrt(d * scale_factor)
-        c2p_base_idx_l_l: Option<&Tensor>, // (L,L) I64 in [0, 2*span)
-        p2c_base_idx_l_l: Option<&Tensor>, // (L,L) I64 in [0, 2*span)
+        query_layer: &Tensor,         // (B*H, Lq, d)
+        key_layer: &Tensor,           // (B*H, Lk, d)
+        rel_embeddings: &Tensor,      // (2*att_span, hidden)
+        inv_scale: f64,               // 1 / sqrt(d * scale_factor)
+        c2p_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
+        p2c_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
     ) -> Result<Tensor> {
         let (total_bs_heads, _q_len, d_head) = query_layer.dims3()?;
         let n_head = self.num_attention_heads;
@@ -362,28 +358,8 @@ impl DebertaV2DisentangledSelfAttention {
             self.max_relative_positions
         };
 
-        // Normalize relative_pos to 4D: (1,1,Lq,Lk) if needed
-        let relative_pos_4d = if relative_pos.is_some()
-            && (c2p_base_idx_l_l.is_none() || p2c_base_idx_l_l.is_none())
-        {
-            let relative_pos = relative_pos.unwrap();
-            Some(match relative_pos.dims().len() {
-                2 => relative_pos.unsqueeze(0)?.unsqueeze(0)?,
-                3 => relative_pos.unsqueeze(1)?,
-                4 => relative_pos.clone(),
-                other => bail!(
-                    "Relative position ids must be of dim 2, 3, or 4. Got {}",
-                    other
-                ),
-            })
-        } else {
-            None
-        };
-
-        // Match dtypes once.
         let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
 
-        // Helper: cache projector outputs on rel_embeddings.
         let get_cached_proj = |cache: &Mutex<Option<Tensor>>,
                                direct: &dyn Fn(&Tensor) -> Result<Tensor>|
          -> Result<Tensor> {
@@ -406,19 +382,23 @@ impl DebertaV2DisentangledSelfAttention {
         // Cached accessors for reshaped per-head tensors
         let get_pos_key_h2span = |raw: Tensor| -> Result<Tensor> {
             let mut g = self.pos_key_h2span_cache.lock().unwrap();
-            if let Some(t) = g.as_ref() { return Ok(t.clone()); }
+            if let Some(t) = g.as_ref() {
+                return Ok(t.clone());
+            }
             let t = reshape_base(raw)?;
             *g = Some(t.clone());
             Ok(t)
         };
         let get_pos_query_h2span = |raw: Tensor| -> Result<Tensor> {
             let mut g = self.pos_query_h2span_cache.lock().unwrap();
-            if let Some(t) = g.as_ref() { return Ok(t.clone()); }
+            if let Some(t) = g.as_ref() {
+                return Ok(t.clone());
+            }
             let t = reshape_base(raw)?;
             *g = Some(t.clone());
             Ok(t)
         };
-    
+
         let mut score: Option<Tensor> = None;
 
         // ---- c2p ----
@@ -445,26 +425,11 @@ impl DebertaV2DisentangledSelfAttention {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
 
-            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
-
-            // integer-only indices (prefer cached base (L,L), else derive from relative_pos)
-            let c2p_pos_l_l = if let Some(idx) = c2p_base_idx_l_l {
-                idx.clone()
-            } else {
-                let relative_pos = relative_pos_4d.as_ref().ok_or_else(|| {
-                    candle::Error::Msg("relative_pos required to build c2p indices".into())
-                })?;
-                relative_pos
-                    .broadcast_add(&self.cached_att_span_i64)?
-                    .clamp(0i64, (2 * att_span - 1) as i64)?
-                    .squeeze(0)?
-                    .squeeze(0)? // (Lq,Lk)
-            };
-            let c2p_indices = c2p_pos_l_l
-                .unsqueeze(0)?
-                .broadcast_as((total_bs_heads, c2p_pos_l_l.dim(0)?, c2p_pos_l_l.dim(1)?))?
-                .to_dtype(DType::U32)?;
-
+            let c2p_att = query_layer
+                .matmul(&pos_key_layer.transpose(1, 2)?)?
+                .contiguous()?;
+            let c2p_indices =
+                c2p_idx_bhl.ok_or_else(|| candle::Error::Msg("missing c2p_idx_bhl".into()))?;
             let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
             let c2p_scaled = (c2p_att_gathered * inv_scale)?;
             score = Some(match score {
@@ -499,25 +464,11 @@ impl DebertaV2DisentangledSelfAttention {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
 
-            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
-
-            // integer-only: att_span - rel_pos (prefer cached base (L,L))
-            let p2c_pos_l_l = if let Some(idx) = p2c_base_idx_l_l {
-                idx.clone()
-            } else {
-                let relative_pos = relative_pos_4d.as_ref().ok_or_else(|| {
-                    candle::Error::Msg("relative_pos required to build p2c indices".into())
-                })?;
-                self.cached_att_span_i64
-                    .broadcast_sub(relative_pos)?
-                    .clamp(0i64, (2 * att_span - 1) as i64)?
-                    .squeeze(0)?
-                    .squeeze(0)? // (Lq,Lk)
-            };
-            let p2c_indices = p2c_pos_l_l
-                .unsqueeze(0)?
-                .broadcast_as((total_bs_heads, p2c_pos_l_l.dim(0)?, p2c_pos_l_l.dim(1)?))?
-                .to_dtype(DType::U32)?;
+            let p2c_att = key_layer
+                .matmul(&pos_query_layer.transpose(1, 2)?)?
+                .contiguous()?;
+            let p2c_indices =
+                p2c_idx_bhl.ok_or_else(|| candle::Error::Msg("missing p2c_idx_bhl".into()))?;
 
             let p2c_att_gathered = p2c_att.gather(&p2c_indices, D::Minus1)?.transpose(1, 2)?;
             let p2c_scaled = (p2c_att_gathered * inv_scale)?;
@@ -573,18 +524,16 @@ impl DebertaV2Attention {
         hidden_states: &Tensor,
         attn_bias_bhl: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
-        relative_pos: Option<&Tensor>,
-        c2p_base_idx_l_l: Option<&Tensor>,
-        p2c_base_idx_l_l: Option<&Tensor>,
+        c2p_idx_bhl: Option<&Tensor>,
+        p2c_idx_bhl: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let self_out = self.self_attention.forward(
             hidden_states,
             attn_bias_bhl,
             relative_embeddings,
-            relative_pos,
-            c2p_base_idx_l_l,
-            p2c_base_idx_l_l,
+            c2p_idx_bhl,
+            p2c_idx_bhl,
         )?;
         let y = self.dense.forward(&self_out)?;
         self.layer_norm.forward(&y, Some(hidden_states))
@@ -642,18 +591,16 @@ impl DebertaV2Layer {
         hidden_states: &Tensor,
         attn_bias_bhl: Option<&Tensor>,
         relative_embeddings: Option<&Tensor>,
-        relative_pos: Option<&Tensor>,
-        c2p_base_idx_l_l: Option<&Tensor>,
-        p2c_base_idx_l_l: Option<&Tensor>,
+        c2p_idx_bhl: Option<&Tensor>,
+        p2c_idx_bhl: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let x = self.attention.forward(
             hidden_states,
             attn_bias_bhl,
             relative_embeddings,
-            relative_pos,
-            c2p_base_idx_l_l,
-            p2c_base_idx_l_l,
+            c2p_idx_bhl,
+            p2c_idx_bhl,
         )?;
         let h = self.intermediate.forward(&x)?;
         self.layer_norm.forward(&self.output.forward(&h)?, Some(&x))
@@ -702,10 +649,11 @@ struct DebertaV2Encoder {
     relative_attention: bool,
     position_buckets: i64,
     max_relative_positions: i64,
-    rel_pos_full: Option<Tensor>,                 // (1, Lmax, Lmax), I64
-    rel_embeddings_cached: Option<Tensor>,        // (2*att_span, hidden), dtype of params
-    c2p_idx_cache: Mutex<HashMap<usize, Tensor>>, // (L,L) I64 in [0,2*span)
-    p2c_idx_cache: Mutex<HashMap<usize, Tensor>>, // (L,L) I64 in [0,2*span)
+    rel_pos_full: Option<Tensor>,          // (1, Lmax, Lmax), I64
+    rel_embeddings_cached: Option<Tensor>, // (2*att_span, hidden), dtype of params
+    // Full-size (1, Lmax, Lmax) index maps in U32; slice to (L,L) at runtime.
+    c2p_full_u32: Option<Tensor>,
+    p2c_full_u32: Option<Tensor>,
     span: tracing::Span,
 }
 
@@ -751,6 +699,27 @@ impl DebertaV2Encoder {
             None
         };
 
+        // Precompute full c2p/p2c index maps once (U32) to avoid per-L caches.
+        let (c2p_full_u32, p2c_full_u32) = if let Some(rp_full) = &rel_pos_full {
+            let att_span = if position_buckets > 0 {
+                position_buckets
+            } else {
+                max_relative_positions
+            };
+            let att_span_t = Tensor::new(&[att_span as i64], vb.device())?;
+            let c2p = rp_full
+                .broadcast_add(&att_span_t)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .to_dtype(DType::U32)?;
+            let p2c = att_span_t
+                .broadcast_sub(rp_full)?
+                .clamp(0i64, (2 * att_span - 1) as i64)?
+                .to_dtype(DType::U32)?;
+            (Some(c2p), Some(p2c))
+        } else {
+            (None, None)
+        };
+
         // Cache normalized rel-embeddings once
         let rel_embeddings_cached = if let Some(rel_attn_layer) = &relative_attention_layer {
             let mut e = rel_attn_layer.get_rel_embedding()?;
@@ -771,8 +740,8 @@ impl DebertaV2Encoder {
             max_relative_positions,
             rel_pos_full,
             rel_embeddings_cached,
-            c2p_idx_cache: Mutex::new(HashMap::new()),
-            p2c_idx_cache: Mutex::new(HashMap::new()),
+            c2p_full_u32,
+            p2c_full_u32,
             span: tracing::span!(tracing::Level::TRACE, "encoder"),
         })
     }
@@ -806,37 +775,28 @@ impl DebertaV2Encoder {
         }
     }
 
-    fn get_c2p_p2c_indices(&self, l: usize, device: &Device) -> Result<(Tensor, Tensor)> {
-        let mut c_guard = self.c2p_idx_cache.lock().unwrap();
-        let mut p_guard = self.p2c_idx_cache.lock().unwrap();
-        if let (Some(c), Some(p)) = (c_guard.get(&l), p_guard.get(&l)) {
-            return Ok((c.clone(), p.clone()));
-        }
-        let rp = self
-            .rel_pos_full
+    fn get_c2p_p2c_indices(&self, l: usize) -> Result<(Tensor, Tensor)> {
+        let c2p = self
+            .c2p_full_u32
             .as_ref()
-            .expect("rel_pos_full missing")
+            .expect("c2p_full_u32 missing")
             .narrow(1, 0, l)?
-            .narrow(2, 0, l)?; // (1,L,L) I64
-        let att_span = self.att_span();
-        // c2p: rel + att_span
-        let c2p = rp
-            .broadcast_add(&Tensor::new(&[att_span as i64], device)?)?
-            .clamp(0i64, (2 * att_span - 1) as i64)?
-            .squeeze(0)?; // (L,L) I64
-                          // p2c: att_span - rel
-        let p2c = Tensor::new(&[att_span as i64], device)?
-            .broadcast_sub(&rp)?
-            .clamp(0i64, (2 * att_span - 1) as i64)?
-            .squeeze(0)?; // (L,L) I64
-        c_guard.insert(l, c2p.clone());
-        p_guard.insert(l, p2c.clone());
+            .narrow(2, 0, l)?
+            .squeeze(0)?
+            .contiguous()?; // (L,L) I64
+        let p2c = self
+            .p2c_full_u32
+            .as_ref()
+            .expect("p2c_full_u32 missing")
+            .narrow(1, 0, l)?
+            .narrow(2, 0, l)?
+            .squeeze(0)?
+            .contiguous()?; // (L,L) I64;
         Ok((c2p, p2c))
     }
 
     fn forward(&self, hidden_states: &Tensor, attn_mask_b11l: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let relative_pos = self.get_rel_pos(hidden_states)?;
         let relative_embeddings = self.get_rel_embedding()?;
 
         let (b, l, _) = hidden_states.dims3()?;
@@ -857,10 +817,17 @@ impl DebertaV2Encoder {
         let mut current_ref: &Tensor = hidden_states;
         let mut current_owned: Option<Tensor> = None;
 
-        // Precompute (L,L) index maps once per forward (and cache across forwards)
-        let (c2p_idx_l_l, p2c_idx_l_l) = if self.relative_attention {
-            let (c2p, p2c) = self.get_c2p_p2c_indices(l, hidden_states.device())?;
-            (Some(c2p), Some(p2c))
+        let (c2p_idx_bhl, p2c_idx_bhl) = if self.relative_attention {
+            let (c2p_l_l, p2c_l_l) = self.get_c2p_p2c_indices(l)?;
+            let c2p_bhl = c2p_l_l
+                .unsqueeze(0)?
+                .broadcast_as((b * h, l, l))?
+                .contiguous()?;
+            let p2c_bhl = p2c_l_l
+                .unsqueeze(0)?
+                .broadcast_as((b * h, l, l))?
+                .contiguous()?;
+            (Some(c2p_bhl), Some(p2c_bhl))
         } else {
             (None, None)
         };
@@ -870,9 +837,8 @@ impl DebertaV2Encoder {
                 current_ref,
                 attn_bias_bhl.as_ref(),
                 relative_embeddings.as_ref(),
-                relative_pos.as_ref(),
-                c2p_idx_l_l.as_ref(),
-                p2c_idx_l_l.as_ref(),
+                c2p_idx_bhl.as_ref(),
+                p2c_idx_bhl.as_ref(),
             )?;
             current_owned = Some(next);
             current_ref = current_owned.as_ref().unwrap();
