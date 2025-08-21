@@ -358,8 +358,6 @@ impl DebertaV2DisentangledSelfAttention {
             self.max_relative_positions
         };
 
-        let rel_embeddings = rel_embeddings.to_dtype(query_layer.dtype())?;
-
         let get_cached_proj = |cache: &Mutex<Option<Tensor>>,
                                direct: &dyn Fn(&Tensor) -> Result<Tensor>|
          -> Result<Tensor> {
@@ -425,9 +423,7 @@ impl DebertaV2DisentangledSelfAttention {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
 
-            let c2p_att = query_layer
-                .matmul(&pos_key_layer.transpose(1, 2)?)?
-                .contiguous()?;
+            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
             let c2p_indices =
                 c2p_idx_bhl.ok_or_else(|| candle::Error::Msg("missing c2p_idx_bhl".into()))?;
             let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
@@ -464,9 +460,7 @@ impl DebertaV2DisentangledSelfAttention {
                 h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
             };
 
-            let p2c_att = key_layer
-                .matmul(&pos_query_layer.transpose(1, 2)?)?
-                .contiguous()?;
+            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
             let p2c_indices =
                 p2c_idx_bhl.ok_or_else(|| candle::Error::Msg("missing p2c_idx_bhl".into()))?;
 
