@@ -252,9 +252,13 @@ impl DebertaV2DisentangledSelfAttention {
         };
         let use_cublaslt = {
             #[cfg(feature = "cuda")]
-            { matches!(device, Device::Cuda(_)) && get_cublas_lt_wrapper().is_some() }
+            {
+                matches!(device, Device::Cuda(_)) && get_cublas_lt_wrapper().is_some()
+            }
             #[cfg(not(feature = "cuda"))]
-            { false }
+            {
+                false
+            }
         };
 
         Ok(Self {
@@ -282,14 +286,13 @@ impl DebertaV2DisentangledSelfAttention {
         })
     }
 
-
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_bhl: Option<&Tensor>,        // (BH, L, L) additive
-        relative_embeddings: Option<&Tensor>,  // (2*span, hidden)
-        c2p_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32
-        p2c_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32
+        attn_bias_bhl: Option<&Tensor>,       // (BH, L, L) additive
+        relative_embeddings: Option<&Tensor>, // (2*span, hidden)
+        c2p_idx_bhl: Option<&Tensor>,         // (BH, L, L) U32
+        p2c_idx_bhl: Option<&Tensor>,         // (BH, L, L) U32
     ) -> Result<Tensor> {
         let (b, l, _) = hidden_states.dims3()?;
         let h = self.num_attention_heads;
@@ -297,7 +300,8 @@ impl DebertaV2DisentangledSelfAttention {
         let device = hidden_states.device();
 
         // Q/K/V
-        let qkv = self.qkv_linear
+        let qkv = self
+            .qkv_linear
             .forward(hidden_states)?
             .reshape((b, l, h * 3, d))?
             .transpose(1, 2)?
@@ -310,7 +314,9 @@ impl DebertaV2DisentangledSelfAttention {
         // relative bias (BH,L,L)
         let rel_bias_bhl = if let Some(rel_e) = relative_embeddings {
             Some(self.disentangled_attention_bias(&q, &k, rel_e, c2p_idx_bhl, p2c_idx_bhl)?)
-        } else { None };
+        } else {
+            None
+        };
 
         // alpha = 1/sqrt(d * n_terms)
         let n_terms = 1 + self.use_c2p_att as usize + self.use_p2c_att as usize;
@@ -328,25 +334,31 @@ impl DebertaV2DisentangledSelfAttention {
                     };
                     match (rel_scaled, attn_bias_bhl) {
                         (Some(rs), Some(m)) => Some(rs.add(&m.to_dtype(q.dtype())?)?.contiguous()?),
-                        (Some(rs), None)    => Some(rs.contiguous()?),
-                        (None, Some(m))     => Some(m.to_dtype(q.dtype())?.contiguous()?),
-                        (None, None)        => None,
+                        (Some(rs), None) => Some(rs.contiguous()?),
+                        (None, Some(m)) => Some(m.to_dtype(q.dtype())?.contiguous()?),
+                        (None, None) => None,
                     }
                 };
                 let c_ref = fused_c_owned.as_ref();
 
-                let cublaslt = get_cublas_lt_wrapper()
-                    .ok_or_else(|| candle::Error::Msg("cuBLASLt requested but not available".into()))?;
+                let cublaslt = get_cublas_lt_wrapper().ok_or_else(|| {
+                    candle::Error::Msg("cuBLASLt requested but not available".into())
+                })?;
 
                 // scores = alpha * (Q K^T) + C   (B·A^T with A=k, B=q)
                 let beta = if c_ref.is_some() { Some(1.0) } else { None };
-                let attention_scores = cublaslt.batch_matmul(
-                    &k, &q, c_ref, Some(alpha), beta, None, None,
-                )?;
+                let attention_scores =
+                    cublaslt.batch_matmul(&k, &q, c_ref, Some(alpha), beta, None, None)?;
 
                 let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
                 let context_bhld = cublaslt.batch_matmul(
-                    &v.transpose(1, 2)?.contiguous()?, &attention_probs, None, None, None, None, None,
+                    &v.transpose(1, 2)?.contiguous()?,
+                    &attention_probs,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )?;
 
                 return context_bhld
@@ -363,9 +375,13 @@ impl DebertaV2DisentangledSelfAttention {
 
         // Plain path
         let mut attn = q.matmul(&k.transpose(1, 2)?.contiguous()?)?; // (BH,L,L)
-        if let Some(rb) = rel_bias_bhl.as_ref() { attn = attn.add(rb)?; }
+        if let Some(rb) = rel_bias_bhl.as_ref() {
+            attn = attn.add(rb)?;
+        }
         attn = attn.broadcast_mul(&alpha_t)?;
-        if let Some(m) = attn_bias_bhl { attn = attn.add(m)?; }
+        if let Some(m) = attn_bias_bhl {
+            attn = attn.add(m)?;
+        }
 
         let probs = candle_nn::ops::softmax_last_dim(&attn)?;
         probs
@@ -375,7 +391,6 @@ impl DebertaV2DisentangledSelfAttention {
             .contiguous()?
             .reshape((b, l, self.all_head_size))
     }
-
 
     fn disentangled_attention_bias(
         &self,
