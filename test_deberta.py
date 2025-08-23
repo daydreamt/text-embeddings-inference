@@ -1,6 +1,6 @@
 import json
 import subprocess
-import time
+from time import perf_counter
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -50,6 +50,7 @@ class DeBERTaBatchTester:
         tei_url: str,
         num_samples: int,
         batch_size: int = 8,
+        use_cuda: bool = False,
     ) -> None:
         self.model_id = model_id
         self.candle_binary = candle_binary
@@ -57,8 +58,9 @@ class DeBERTaBatchTester:
         self.num_samples = num_samples
         self.batch_size = batch_size
 
-        # Hugging Face model
         self.hf_model = AutoModelForSequenceClassification.from_pretrained(model_id)
+        self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+        self.hf_model.to(self.device)
         self.hf_tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.hf_model.eval()
 
@@ -109,15 +111,21 @@ class DeBERTaBatchTester:
     # ---------------------------------------------------------------------
 
     def _hf_batch(self, sentences: List[str]) -> Tuple[List[ClassificationResult], float]:
-        t0 = time.time()
+        t0 = perf_counter()
+        if getattr(self, "device", torch.device("cpu")).type == "cuda":
+            torch.cuda.synchronize()
         toks = self.hf_tokenizer(
             sentences, return_tensors="pt", padding=True, truncation=False
         )
+        toks = {k: v.to(self.device) for k, v in toks.items()}
+
         with torch.no_grad():
             probs = torch.nn.functional.softmax(
                 self.hf_model(**toks).logits, dim=-1
             )
-        elapsed = (time.time() - t0) * 1000
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = (perf_counter() - t0) * 1000
 
         id2label = self.hf_model.config.id2label
         top1 = torch.topk(probs, 1, dim=-1)
@@ -133,10 +141,11 @@ class DeBERTaBatchTester:
 
     def _tei_batch(self, sentences: List[str]) -> Tuple[List[ClassificationResult], float]:
         payload = {"inputs": [[s] for s in sentences]}
-        t0 = time.time()
+        t0 = perf_counter()
         r = requests.post(self.tei_url, json=payload, timeout=30)
         r.raise_for_status()
-        elapsed = (time.time() - t0) * 1000
+        elapsed = (perf_counter() - t0) * 1000
+
 
         data = r.json()  # outer list per sentence, inner list per class
         results: List[ClassificationResult] = []
@@ -234,6 +243,7 @@ if __name__ == "__main__":
     p.add_argument("--num-samples", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--out-csv", default="test_results.csv")
+    p.add_argument("--cuda", action="store_true", help="Run HF model on GPU (if available)")
     args = p.parse_args()
 
     tester = DeBERTaBatchTester(
@@ -242,6 +252,7 @@ if __name__ == "__main__":
         tei_url=args.tei_url,
         num_samples=args.num_samples,
         batch_size=args.batch_size,
+        use_cuda=args.cuda,
     )
 
     df = DeBERTaBatchTester.to_dataframe(tester.run())
