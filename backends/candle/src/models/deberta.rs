@@ -177,6 +177,7 @@ struct DebertaV2DisentangledSelfAttention {
     cached_att_span_i64: Tensor,                // scalar [att_span] as i64
     pos_key_h2span_cache: Mutex<Option<Tensor>>, // (H, 2*span, d)
     pos_query_h2span_cache: Mutex<Option<Tensor>>, // (H, 2*span, d)
+    use_cublaslt: bool,
 }
 
 impl DebertaV2DisentangledSelfAttention {
@@ -249,6 +250,12 @@ impl DebertaV2DisentangledSelfAttention {
                 .max_relative_positions
                 .unwrap_or(config.max_position_embeddings as i64)
         };
+        let use_cublaslt = {
+            #[cfg(feature = "cuda")]
+            { matches!(device, Device::Cuda(_)) && get_cublas_lt_wrapper().is_some() }
+            #[cfg(not(feature = "cuda"))]
+            { false }
+        };
 
         Ok(Self {
             qkv_linear,
@@ -271,6 +278,7 @@ impl DebertaV2DisentangledSelfAttention {
             cached_att_span_i64: Tensor::new(&[att_span as i64], &device)?,
             pos_key_h2span_cache: Mutex::new(None),
             pos_query_h2span_cache: Mutex::new(None),
+            use_cublaslt,
         })
     }
 
@@ -278,110 +286,96 @@ impl DebertaV2DisentangledSelfAttention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_bhl: Option<&Tensor>,        // (BH, L, L), additive (0 keep, -inf mask)
-        relative_embeddings: Option<&Tensor>,  // (2*span, hidden) or None
-        c2p_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32 or None
-        p2c_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32 or None
-    ) -> candle::Result<Tensor> {
+        attn_bias_bhl: Option<&Tensor>,        // (BH, L, L) additive
+        relative_embeddings: Option<&Tensor>,  // (2*span, hidden)
+        c2p_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32
+        p2c_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32
+    ) -> Result<Tensor> {
         let (b, l, _) = hidden_states.dims3()?;
         let h = self.num_attention_heads;
         let d = self.attention_head_size;
         let device = hidden_states.device();
 
-        // ---- Q/K/V ----
-        let qkv = self
-            .qkv_linear
+        // Q/K/V
+        let qkv = self.qkv_linear
             .forward(hidden_states)?
             .reshape((b, l, h * 3, d))?
             .transpose(1, 2)?
             .contiguous()?; // (B, 3H, L, d)
-
         let chunks = qkv.chunk(3, 1)?;
-        let q = chunks[0].contiguous()?.reshape((b * h, l, d))?; // (BH, L, d)
+        let q = chunks[0].contiguous()?.reshape((b * h, l, d))?;
         let k = chunks[1].contiguous()?.reshape((b * h, l, d))?;
         let v = chunks[2].contiguous()?.reshape((b * h, l, d))?;
 
-        // ---- relative bias (BH, L, L) exactly like your original ----
+        // relative bias (BH,L,L)
         let rel_bias_bhl = if let Some(rel_e) = relative_embeddings {
             Some(self.disentangled_attention_bias(&q, &k, rel_e, c2p_idx_bhl, p2c_idx_bhl)?)
-        } else {
-            None
-        };
+        } else { None };
 
-        // number of score terms combined before scaling
+        // alpha = 1/sqrt(d * n_terms)
         let n_terms = 1 + self.use_c2p_att as usize + self.use_p2c_att as usize;
-        let scale = Tensor::new(((d * n_terms) as f32).sqrt(), device)?
-            .to_dtype(q.dtype())?;
+        let alpha: f32 = 1.0 / ((d * n_terms) as f32).sqrt();
+        let alpha_t = Tensor::new(alpha, device)?.to_dtype(q.dtype())?; // scalar tensor
 
-        // ---- scores: QK^T via cuBLASLt when available, no bias fused here ----
-        // result is (BH, L, L)
-        let scores_qk: Tensor = {
+        if self.use_cublaslt {
             #[cfg(feature = "cuda")]
             {
-                if matches!(device, candle::Device::Cuda(_)) && get_cublas_lt_wrapper().is_some() {
-                    // cuBLASLt wrapper follows the same operand order as the Bert fast-path:
-                    // attention = Q·K^T    is achieved by calling batch_matmul(&k, &q, ...),
-                    // because the wrapper computes B · A^T internally.
-                    let cublaslt = get_cublas_lt_wrapper().unwrap();
-                    cublaslt.batch_matmul(
-                        &k,   // (BH, L, d)
-                        &q,   // (BH, L, d)
-                        None, // no fused bias here
-                        None, // no alpha (we'll scale after adding rel_bias, like the original)
-                        None, None, None,
-                    )?
-                } else {
-                    q.matmul(&k.transpose(1, 2)?.contiguous()?)?
-                }
+                // fused C = alpha*rel_bias + mask  (contiguous, dtype==Q/K)
+                let fused_c_owned: Option<Tensor> = {
+                    let rel_scaled = match rel_bias_bhl.as_ref() {
+                        Some(rb) => Some(rb.broadcast_mul(&alpha_t)?.to_dtype(q.dtype())?),
+                        None => None,
+                    };
+                    match (rel_scaled, attn_bias_bhl) {
+                        (Some(rs), Some(m)) => Some(rs.add(&m.to_dtype(q.dtype())?)?.contiguous()?),
+                        (Some(rs), None)    => Some(rs.contiguous()?),
+                        (None, Some(m))     => Some(m.to_dtype(q.dtype())?.contiguous()?),
+                        (None, None)        => None,
+                    }
+                };
+                let c_ref = fused_c_owned.as_ref();
+
+                let cublaslt = get_cublas_lt_wrapper()
+                    .ok_or_else(|| candle::Error::Msg("cuBLASLt requested but not available".into()))?;
+
+                // scores = alpha * (Q K^T) + C   (B·A^T with A=k, B=q)
+                let beta = if c_ref.is_some() { Some(1.0) } else { None };
+                let attention_scores = cublaslt.batch_matmul(
+                    &k, &q, c_ref, Some(alpha), beta, None, None,
+                )?;
+
+                let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
+                let context_bhld = cublaslt.batch_matmul(
+                    &v.transpose(1, 2)?.contiguous()?, &attention_probs, None, None, None, None, None,
+                )?;
+
+                return context_bhld
+                    .reshape((b, h, l, d))?
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, l, self.all_head_size));
             }
             #[cfg(not(feature = "cuda"))]
             {
-                q.matmul(&k.transpose(1, 2)?.contiguous()?)?
+                unreachable!("use_cublaslt set without CUDA feature");
             }
-        };
-
-        // ---- original math: add rel_bias, scale once, then add mask ----
-        let mut attn = match rel_bias_bhl {
-            Some(rb) => scores_qk.add(&rb)?,
-            None => scores_qk,
-        };
-        attn = attn.broadcast_div(&scale)?;
-        if let Some(m) = attn_bias_bhl {
-            attn = attn.add(m)?;
         }
 
-        // ---- softmax ----
+        // Plain path
+        let mut attn = q.matmul(&k.transpose(1, 2)?.contiguous()?)?; // (BH,L,L)
+        if let Some(rb) = rel_bias_bhl.as_ref() { attn = attn.add(rb)?; }
+        attn = attn.broadcast_mul(&alpha_t)?;
+        if let Some(m) = attn_bias_bhl { attn = attn.add(m)?; }
+
         let probs = candle_nn::ops::softmax_last_dim(&attn)?;
-
-        // ---- context: (BH, L, L) @ (BH, L, d) -> (BH, L, d); use cuBLASLt if available ----
-        let context_bhld: Tensor = {
-            #[cfg(feature = "cuda")]
-            {
-                if matches!(device, candle::Device::Cuda(_)) && get_cublas_lt_wrapper().is_some() {
-                    let cublaslt = get_cublas_lt_wrapper().unwrap();
-                    // The wrapper computes B · A^T, so pass A = V^T (d, L), B = probs (L, L)
-                    cublaslt.batch_matmul(
-                        &v.transpose(1, 2)?.contiguous()?, // A: (BH, d, L)
-                        &probs,                             // B: (BH, L, L)
-                        None, None, None, None, None,
-                    )?
-                } else {
-                    probs.matmul(&v)?
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                probs.matmul(&v)?
-            }
-        };
-
-        // ---- reshape back to (B, L, H*d) ----
-        context_bhld
+        probs
+            .matmul(&v)?
             .reshape((b, h, l, d))?
-            .transpose(1, 2)?   // (B, L, H, d)
+            .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.all_head_size))
     }
+
 
     fn disentangled_attention_bias(
         &self,
