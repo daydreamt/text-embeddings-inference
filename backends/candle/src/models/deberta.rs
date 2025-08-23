@@ -277,74 +277,89 @@ impl DebertaV2DisentangledSelfAttention {
     fn forward(
         &self,
         hidden_states: &Tensor,
-        attn_bias_bhl: Option<&Tensor>, // (BH,L,L) or None
-        relative_embeddings: Option<&Tensor>,
-        c2p_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
-        p2c_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
+        attn_bias_bhl: Option<&Tensor>,        // (BH, L, L) additive (0 keep, -big mask) or bool
+        relative_embeddings: Option<&Tensor>,  // (2*span, hidden) or None
+        c2p_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32 or None
+        p2c_idx_bhl: Option<&Tensor>,          // (BH, L, L) U32 or None
     ) -> Result<Tensor> {
         let (b, l, _) = hidden_states.dims3()?;
 
-        // Fused QKV -> split to (B*H, L, d)
+        // ---- content Q/K/V ----
         let qkv = self
             .qkv_linear
             .forward(hidden_states)?
             .reshape((b, l, self.num_attention_heads * 3, self.attention_head_size))?
-            .transpose(1, 2)?; // (B, 3H, L, d)
+            .transpose(1, 2)?
+            .contiguous()?; // ensure base is compact before chunking
+
         let chunks = qkv.chunk(3, 1)?;
-        let q = chunks[0].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
-        let k = chunks[1].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
-        let v = chunks[2].reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
+        let q = chunks[0]
+            .contiguous()?
+            .reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
+        let k = chunks[1]
+            .contiguous()?
+            .reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
+        let v = chunks[2]
+            .contiguous()?
+            .reshape((b * self.num_attention_heads, l, self.attention_head_size))?;
 
-        // Scale like the fast reference: divide K by sqrt(d * scale_factor).
-        let mut scale_factor: usize = 1;
-        if self.use_c2p_att {
-            scale_factor += 1;
-        }
-        if self.use_p2c_att {
-            scale_factor += 1;
-        }
+        // ---- raw scores (no scale yet) ----
+        let kt = k.transpose(1, 2)?.contiguous()?;
+        let mut attn = q.matmul(&kt)?; // (BH, L, L)
 
-        let inv_scale: f64 = ((self.attention_head_size * scale_factor) as f64)
-            .sqrt()
-            .recip();
-
-        // Scale Q once, then Q @ K^T (drop extra clone).
-        let q_scaled = (&q * inv_scale)?; // f32/f16-safe scalar mul
-        let mut attn = q_scaled.matmul(&k.transpose(1, 2)?)?; // (B*H, L, L)
-
-        // Relative bias (uses the same scalar inv_scale)
+        // ---- add relative bias (unscaled; we'll scale once after sum) ----
         if let Some(rel_e) = relative_embeddings {
             attn = attn.add(&self.disentangled_attention_bias(
                 &q,
                 &k,
                 rel_e,
-                inv_scale,
                 c2p_idx_bhl,
                 p2c_idx_bhl,
             )?)?;
         }
 
-        if let Some(bias_bhl) = attn_bias_bhl {
-            // Mask already provided as (BH,L,L); avoid per-layer reshape.
-            attn = attn.add(bias_bhl)?;
-        }
-        let probs = candle_nn::ops::softmax_last_dim(&attn)?;
+        // ---- single scaling after all score terms ----
+        let scale_factor = 1 + self.use_c2p_att as usize + self.use_p2c_att as usize;
+        let scale = ((self.attention_head_size * scale_factor) as f32).sqrt();
+        let scale_t = Tensor::new(scale, attn.device())?.to_dtype(attn.dtype())?;
+        attn = attn.broadcast_div(&scale_t)?;
 
-        // Context -> (B,L,all_head)
+        // ---- additive mask (0 keep, -big mask) BEFORE softmax ----
+        if let Some(m) = attn_bias_bhl {
+            if m.dtype() == DType::U8 {
+                // boolean allow mask (1 keep, 0 mask) -> additive -inf where reject
+                let reject = m.eq(&m.zeros_like()?)?; // true where masked
+                let finfo_min_f32 = match attn.dtype() {
+                    DType::F16 => -65504.0f32,
+                    DType::BF16 => -3.38953139e38f32,
+                    _ => f32::MIN,
+                };
+                let neg = Tensor::new(finfo_min_f32, attn.device())?.to_dtype(attn.dtype())?;
+                let zeros = Tensor::new(0f32, attn.device())?.to_dtype(attn.dtype())?;
+                let addm = reject.where_cond(&neg, &zeros)?;
+                attn = attn.add(&addm)?;
+            } else {
+                // already additive
+                attn = attn.add(m)?;
+            }
+        }
+
+        // ---- softmax & context ----
+        let probs = candle_nn::ops::softmax_last_dim(&attn)?;
         probs
-            .matmul(&v)?
+            .matmul(&v)?                                         // (BH, L, d)
             .reshape((b, self.num_attention_heads, l, self.attention_head_size))?
-            .transpose(1, 2)?
+            .transpose(1, 2)?                                    // (B, L, H, d)
             .contiguous()?
-            .reshape((b, l, self.all_head_size))
+            .reshape((b, l, self.all_head_size))                 // (B, L, H*d)
     }
+
 
     fn disentangled_attention_bias(
         &self,
         query_layer: &Tensor,         // (B*H, Lq, d)
         key_layer: &Tensor,           // (B*H, Lk, d)
         rel_embeddings: &Tensor,      // (2*att_span, hidden)
-        inv_scale: f64,               // 1 / sqrt(d * scale_factor)
         c2p_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
         p2c_idx_bhl: Option<&Tensor>, // (BH,L,L) U32
     ) -> Result<Tensor> {
@@ -370,14 +385,12 @@ impl DebertaV2DisentangledSelfAttention {
             Ok(t)
         };
 
-        // Reshape projector output to (H, 2*span, d)
         let reshape_base = |base: Tensor| -> Result<Tensor> {
             base.reshape((2 * att_span as usize, n_head, d_head))?
                 .transpose(0, 1)? // (H, 2*span, d)
                 .contiguous()
         };
 
-        // Cached accessors for reshaped per-head tensors
         let get_pos_key_h2span = |raw: Tensor| -> Result<Tensor> {
             let mut g = self.pos_key_h2span_cache.lock().unwrap();
             if let Some(t) = g.as_ref() {
@@ -410,27 +423,22 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_key_proj, &|e| proj.forward(e))?
             };
 
-            // (H,2*span,d) cached
-            let h_2span_d = get_pos_key_h2span(base)?; // (H,2*span,d)
+            let h_2span_d = get_pos_key_h2span(base)?; // (H, 2*span, d)
+            let pos_key_layer = h_2span_d
+                .unsqueeze(0)? // (1, H, 2*span, d)
+                .broadcast_as((bs, n_head, (2 * att_span) as usize, d_head))?
+                .contiguous()?
+                .reshape((total_bs_heads, (2 * att_span) as usize, d_head))?;
 
-            let pos_key_layer = if bs > 1 {
-                h_2span_d.repeat(bs)?.contiguous()?.reshape((
-                    total_bs_heads,
-                    2 * att_span as usize,
-                    d_head,
-                ))?
-            } else {
-                h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
-            };
-
-            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?)?;
-            let c2p_indices =
-                c2p_idx_bhl.ok_or_else(|| candle::Error::Msg("missing c2p_idx_bhl".into()))?;
-            let c2p_att_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
-            let c2p_scaled = (c2p_att_gathered * inv_scale)?;
+            let c2p_att = query_layer.matmul(&pos_key_layer.transpose(1, 2)?.contiguous()?)?;
+            let c2p_indices = c2p_idx_bhl
+                .ok_or_else(|| candle::Error::Msg("missing c2p_idx_bhl".into()))?
+                .to_dtype(DType::I64)?
+                .contiguous()?;
+            let c2p_gathered = c2p_att.gather(&c2p_indices, D::Minus1)?;
             score = Some(match score {
-                Some(s) => s.add(&c2p_scaled)?,
-                None => c2p_scaled,
+                Some(s) => s.add(&c2p_gathered)?,
+                None => c2p_gathered,
             });
         }
 
@@ -448,27 +456,25 @@ impl DebertaV2DisentangledSelfAttention {
                 get_cached_proj(&self.cached_pos_query_proj, &|e| proj.forward(e))?
             };
 
-            // (H,2*span,d) cached
-            let h_2span_d = get_pos_query_h2span(base)?; // (H,2*span,d)
-            let pos_query_layer = if bs > 1 {
-                h_2span_d.repeat(bs)?.contiguous()?.reshape((
-                    total_bs_heads,
-                    2 * att_span as usize,
-                    d_head,
-                ))?
-            } else {
-                h_2span_d.reshape((total_bs_heads, 2 * att_span as usize, d_head))?
-            };
+            let h_2span_d = get_pos_query_h2span(base)?; // (H, 2*span, d)
+            let pos_query_layer = h_2span_d
+                .unsqueeze(0)?
+                .broadcast_as((bs, n_head, (2 * att_span) as usize, d_head))?
+                .contiguous()?
+                .reshape((total_bs_heads, (2 * att_span) as usize, d_head))?;
 
-            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?)?;
-            let p2c_indices =
-                p2c_idx_bhl.ok_or_else(|| candle::Error::Msg("missing p2c_idx_bhl".into()))?;
-
-            let p2c_att_gathered = p2c_att.gather(&p2c_indices, D::Minus1)?.transpose(1, 2)?;
-            let p2c_scaled = (p2c_att_gathered * inv_scale)?;
+            let p2c_att = key_layer.matmul(&pos_query_layer.transpose(1, 2)?.contiguous()?)?;
+            let p2c_indices = p2c_idx_bhl
+                .ok_or_else(|| candle::Error::Msg("missing p2c_idx_bhl".into()))?
+                .to_dtype(DType::I64)?
+                .contiguous()?;
+            let p2c_gathered = p2c_att
+                .gather(&p2c_indices, D::Minus1)?
+                .transpose(1, 2)?
+                .contiguous()?; // keep compact for later adds
             score = Some(match score {
-                Some(s) => s.add(&p2c_scaled)?,
-                None => p2c_scaled,
+                Some(s) => s.add(&p2c_gathered)?,
+                None => p2c_gathered,
             });
         }
 
@@ -477,6 +483,8 @@ impl DebertaV2DisentangledSelfAttention {
             None => query_layer.zeros_like()?,
         })
     }
+
+
 }
 
 struct DebertaV2Attention {
@@ -704,11 +712,11 @@ impl DebertaV2Encoder {
             let c2p = rp_full
                 .broadcast_add(&att_span_t)?
                 .clamp(0i64, (2 * att_span - 1) as i64)?
-                .to_dtype(DType::U32)?;
+                .to_dtype(DType::I64)?;
             let p2c = att_span_t
                 .broadcast_sub(rp_full)?
                 .clamp(0i64, (2 * att_span - 1) as i64)?
-                .to_dtype(DType::U32)?;
+                .to_dtype(DType::I64)?;
             (Some(c2p), Some(p2c))
         } else {
             (None, None)
@@ -1040,13 +1048,14 @@ impl DebertaV2Model {
         let embeddings = DebertaV2Embeddings::load(vb.pp("deberta.embeddings"), config)?;
         let encoder = DebertaV2Encoder::load(vb.pp("deberta.encoder"), config)?;
 
-        // Use a large finite negative to avoid NaNs when an attention row is fully masked.
-        let neg_val = match vb.dtype() {
-            DType::F32 => -1.0e9f32,
-            _ => -65504.0f32,
+        let neg_mask_value_f32 = match vb.dtype() {
+            DType::F16 => -65504.0f32,          // torch.finfo(float16).min
+            DType::BF16 => f32::MIN,            // casted down to bf16 -> ~ -3.3895e38
+            DType::F32 => f32::MIN,             // -3.4028235e38
+            _ => f32::MIN,
         };
-        let neg_mask_value =
-            Tensor::from_slice(&[neg_val], (1,), vb.device())?.to_dtype(vb.dtype());
+        let neg_mask_value = Tensor::from_slice(&[neg_mask_value_f32], (1,), vb.device())?
+            .to_dtype(vb.dtype())?;
 
         Ok(Self {
             embeddings,
@@ -1056,7 +1065,7 @@ impl DebertaV2Model {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
-            neg_mask_value: neg_mask_value?,
+            neg_mask_value,
         })
     }
 
@@ -1072,6 +1081,24 @@ impl DebertaV2Model {
 
         let inv = key.le(&thr)?.to_dtype(self.dtype)?; // (B,1,1,L) in {0,1}
         inv.broadcast_mul(&self.neg_mask_value) // (B,1,1,L) in {0,-big}
+    }
+
+    #[inline]
+    fn make_additive_qk_mask(&self, mask_2d: &Tensor) -> Result<Tensor> {
+        // mask_2d: (B,L) in compute dtype, 1.0=real, 0.0=pad
+        let q = mask_2d.unsqueeze(2)?;           // (B,L,1)
+        let k = mask_2d.unsqueeze(1)?;           // (B,1,L)
+        let qk = q.broadcast_mul(&k)?;           // (B,L,L)
+
+        // Threshold in the same dtype to avoid fp32 upcasts on MPS/CUDA.
+        let thr = Tensor::new(0.5f32, mask_2d.device())?
+            .to_dtype(mask_2d.dtype())?
+            .broadcast_as(qk.shape())?;
+
+        // inv ∈ {0,1} in compute dtype
+        let inv = qk.le(&thr)?.to_dtype(self.dtype)?;
+        // Convert to additive mask with large negative where q or k is pad.
+        inv.unsqueeze(1)?.broadcast_mul(&self.neg_mask_value) // (B,1,L,L)
     }
 
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
@@ -1122,14 +1149,18 @@ impl DebertaV2Model {
             None
         };
 
-        // Embeddings (no mask multiply here)
-        let embedding_output = self
+        let mut embedding_output = self
             .embeddings
             .forward(&input_ids, &type_ids, &position_ids)?;
 
+        // Gate embeddings by the 2-D padding mask
+        if let Some(m2d) = &attention_mask_2d {
+            // (B,L,H) * (B,L,1) -> (B,L,H)
+            embedding_output = embedding_output.broadcast_mul(&m2d.unsqueeze(2)?)?;
+        }
         // Build key-only additive mask (B,1,1,L) once
         let attention_add_mask: Option<Tensor> = match &attention_mask_2d {
-            Some(m) => Some(self.make_additive_key_padding_mask(m)?),
+            Some(m) => Some(self.make_additive_qk_mask(m)?), // (B,1,L,L)
             None => None,
         };
 
@@ -1313,20 +1344,19 @@ pub(crate) fn build_relative_position(
     bucket_size: Option<isize>,
     max_position: Option<isize>,
 ) -> Result<Tensor> {
-    let q_ids = Tensor::arange(0, query_size as i64, device)?.unsqueeze(0)?;
-    let k_ids: Tensor = Tensor::arange(0, key_size as i64, device)?.unsqueeze(D::Minus1)?;
-    let mut rel_pos_ids = k_ids.broadcast_sub(&q_ids)?;
-    let bucket_size = bucket_size.unwrap_or(-1);
-    let max_position = max_position.unwrap_or(-1);
-
-    if bucket_size > 0 && max_position > 0 {
-        rel_pos_ids = make_log_bucket_position(rel_pos_ids, bucket_size, max_position, device)?;
+    // q: (q,1), k: (1,k)
+    let q_ids = Tensor::arange(0, query_size as i64, device)?.unsqueeze(1)?;
+    let k_ids = Tensor::arange(0, key_size as i64, device)?.unsqueeze(0)?;
+    // HF: q - k  -> shape (q,k)
+    let mut rel_pos_ids = q_ids.broadcast_sub(&k_ids)?;
+    if bucket_size.unwrap_or(-1) > 0 && max_position.unwrap_or(-1) > 0 {
+        rel_pos_ids = make_log_bucket_position(
+            rel_pos_ids, bucket_size.unwrap(), max_position.unwrap(), device
+        )?;
     }
-
-    rel_pos_ids = rel_pos_ids.to_dtype(DType::I64)?;
-    rel_pos_ids = rel_pos_ids.narrow(0, 0, query_size)?;
-    rel_pos_ids.unsqueeze(0)
+    rel_pos_ids.to_dtype(DType::I64)?.unsqueeze(0) // (1,q,k)
 }
+
 
 pub(crate) fn make_log_bucket_position(
     relative_pos: Tensor,
