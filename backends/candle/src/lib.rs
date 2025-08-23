@@ -249,7 +249,7 @@ impl CandleBackend {
                     Ok(Box::new(BertModel::load(vb, &config, model_type).s()?))
                 }
             },
-            (Config::DebertaV2(config), Device::Cpu | Device::Metal(_)) => {
+            (Config::DebertaV2(config), Device::Cpu | Device::Metal(_) | Device::Cuda(_)) => {
                 tracing::info!(
                     "Starting DeBERTa-V2 model on {:?} with dtype {:?}",
                     device,
